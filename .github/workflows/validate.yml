@@ -1,0 +1,32 @@
+name: validate
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (linux/amd64)
+        run: time docker build --platform linux/amd64 -t blast-entry .
+      - name: Kit sample set
+        run: |
+          mkdir -p /tmp/kit && cd /tmp/kit
+          curl -fsSL -o kit.tgz https://www.joinbuilders.org/buildathon/tracks/blast-radius/files/blast-radius-sample.tar.gz
+          tar -xzf kit.tgz && ls
+      - name: Run 3x with the scorer's flags and score
+        run: |
+          set -e
+          for i in 1 2 3; do
+            docker run --rm --platform linux/amd64 --network none --cpus 2 \
+              --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+              --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
+              --volume /tmp/kit/sample/commits:/data/commits:ro \
+              --volume /tmp/kit/sample/tests.json:/data/tests.json:ro \
+              --entrypoint sh blast-entry -c 'python /app/selector/main.py; s=$?; grep usage_usec /sys/fs/cgroup/cpu.stat >&2; exit $s' \
+              > out$i.jsonl 2> err$i.log
+            tail -3 err$i.log
+            python3 /tmp/kit/score.py /tmp/kit/sample /tmp/kit/sample/answers.json out$i.jsonl
+          done
