@@ -73,6 +73,17 @@ LIM_TABLES_S = float(os.environ.get("BR_LIM_TABLES", "0.3"))  # loading the TPC 
 LIM_MAX_SHARE = float(os.environ.get("BR_LIM_SHARE", "0.6"))
 P_LIM = float(os.environ.get("BR_P_LIM", "0.5"))  # share of limited replays that prove "unchanged"
 
+# v7. Isolated replay (replay.iso_run): the TPC-DS queries that reach the changed lines are run
+# alone, each in a fork of its own, and must reproduce their baseline and the signature of
+# what they leave behind that was recorded at image build. No probe is needed. It runs before
+# the plain replay, which follows whenever it proves nothing. BR_ISO=0 restores v6 exactly
+# (and removes the per-query CPU limits of the plain replay).
+ISO = os.environ.get("BR_ISO", "1") == "1"
+ISO_PER_QUERY_S = float(os.environ.get("BR_ISO_PER_QUERY", "0.08"))  # fork + collection + signature
+ISO_MAX_SHARE = float(os.environ.get("BR_ISO_SHARE", "0.6"))
+P_ISO = float(os.environ.get("BR_P_ISO", "0.5"))  # share of isolated replays that prove "unchanged"
+ISO_HEUR_MAX_S = float(os.environ.get("BR_ISO_HEUR_MAX", "1.5"))  # dearest proof asked in place of the clean-probe heuristic
+
 MAP_DIR = os.path.dirname(MAP)
 COST = os.environ.get("BR_COST", os.path.join(MAP_DIR, "cost.json"))
 REPLAY = os.environ.get("BR_REPLAY", os.path.join(MAP_DIR, "replay.json"))
@@ -227,6 +238,39 @@ def limited_cost(base, tid: str, queries: list[int], trees: bool) -> float:
         return full_s * share
     tables = min(LIM_TABLES_S, full_s) if reached else 0.0
     return tables + (full_s - min(LIM_TABLES_S, full_s)) * share
+
+
+def iso_target(A, base, skip_exec_ok: bool):
+    """(queries, expected CPU seconds on the cost map's machine) when the isolated replay can
+    speak for test_execute_tpcds, else None. Needs: one changed file, every judged change an
+    edit inside a function body or a lambda; the reach map vouches for every changed range
+    (replay.reach_of: never run at import or set-up, the same queries in every recorded
+    arrangement); at least one query reaches them; each of those has a recorded signature."""
+    if not ISO or base is None or not base.get("iso") or not base.get("reach"):
+        return None
+    if A.code_opaque or len(A.files) != 1 or not A.changes:
+        return None
+    try:
+        import replay
+
+        tid = replay.T_TPCDS
+        qs: set[int] = set()
+        for path, kind, lo, hi in A.changes:
+            if kind not in ("body", "lambda"):
+                return None
+            got = replay.reach_of(base, path, lo, hi, [tid])
+            if got is None:
+                return None
+            qs.update(got[tid])
+        mode = "trees" if skip_exec_ok else "full"
+        sig = base["iso"]["sig"][tid][mode]
+        secs = base["iso"]["t"][tid][mode]
+        if not qs or any(sig[i] is None or secs[i] is None for i in qs):
+            return None
+        cost = sum(secs[i] for i in qs) + ISO_PER_QUERY_S * len(qs) + (0.0 if skip_exec_ok else LIM_TABLES_S)
+        return sorted(qs), cost
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class Costs:
@@ -433,8 +477,37 @@ def limited_replay(A, nums: list[int], id_of, cid: str, base: dict, skip_exec_ok
         shutil.rmtree(overlay, ignore_errors=True)
 
 
+def iso_replay(A, cid: str, base: dict, skip_exec_ok: bool, iso) -> str:
+    """Isolated replay of test_execute_tpcds (replay.iso_run): "same" (proven unchanged), "diff"
+    (a reached query does not reproduce its baseline) or "unknown"."""
+    import warm
+    from runner import build_overlay
+
+    queries, est = iso
+    overlay = os.path.join(WORK, "ovs")
+    try:
+        import replay
+        import resource
+
+        build_overlay(REPO, overlay, patched_files(A, REPO))
+        r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        res, notes = warm.replay_check(overlay, [replay.T_TPCDS], base, skip_exec_ok, WORK,
+                                       20 + 4 * max(est, 2.0), iso=list(queries))
+        r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        verdict = res.get("iso") if res.get("iso") in ("same", "diff", "unknown") else "unknown"
+        log(f"{cid}: iso cpu {r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime:.2f}s "
+            f"({'trees' if skip_exec_ok else 'full'}, {len(queries)} queries, est {est:.2f}s): {verdict}"
+            + (f" | {'; '.join(notes)[:120]}" if notes else ""))
+        return verdict
+    except Exception as exc:  # noqa: BLE001
+        log(f"{cid}: isolated replay failed to run ({exc!r})")
+        return "unknown"
+    finally:
+        shutil.rmtree(overlay, ignore_errors=True)
+
+
 def run_replay(A, nums: list[int], id_of, cid: str, base: dict, skip_exec_ok: bool, est_s: float,
-               lim=None) -> set[int]:
+               lim=None, iso=None) -> set[int]:
     """Replay the given tests on the patched tree; returns those NOT proven unchanged."""
     import warm
     from runner import build_overlay
@@ -446,6 +519,17 @@ def run_replay(A, nums: list[int], id_of, cid: str, base: dict, skip_exec_ok: bo
         proven = limited_replay(A, nums, id_of, cid, base, skip_exec_ok, lim)
         if proven and not REACH_AUDIT:
             return set()
+    iso_verdict = None
+    if iso is not None and not proven:
+        import replay as _rp
+
+        ds = [n for n in nums if id_of[n] == _rp.T_TPCDS]
+        if ds:
+            iso_verdict = iso_replay(A, cid, base, skip_exec_ok, iso)
+            if iso_verdict == "same" and not REACH_AUDIT:
+                nums = [n for n in nums if n not in ds]  # proven; the plain replay speaks for the rest
+                if not nums:
+                    return set()
     overlay = os.path.join(WORK, "ovr")
     try:
         build_overlay(REPO, overlay, patched_files(A, REPO))
@@ -453,9 +537,16 @@ def run_replay(A, nums: list[int], id_of, cid: str, base: dict, skip_exec_ok: bo
 
         r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         res, notes = warm.replay_check(overlay, [id_of[n] for n in nums], base, skip_exec_ok, WORK,
-                                       20 + 4 * max(est_s, REPLAY_FULL_S))
+                                       20 + 4 * max(est_s, REPLAY_FULL_S), timed=ISO)
         r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
         same = [n for n in nums if res.get(id_of[n]) is True]
+        if iso_verdict is not None and REACH_AUDIT:
+            import replay as _rp
+
+            plain_ds = all(res.get(id_of[n]) is True for n in nums if id_of[n] == _rp.T_TPCDS)
+            log(f"{cid}: iso-audit iso={iso_verdict} plain={'same' if plain_ds else 'diff'} "
+                f"({'trees' if skip_exec_ok else 'full'}, {len(iso[0])} queries)"
+                + (" DISAGREE" if iso_verdict == "same" and not plain_ds else ""))
         log(f"{cid}: replay cpu {r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime:.2f}s "
             f"({'trees' if skip_exec_ok else 'full'}): {len(same)}/{len(nums)} unchanged"
             + (f" | {'; '.join(notes)[:120]}" if notes else ""))
@@ -527,6 +618,17 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
             else:
                 for n in replays:  # the limited replay, then the plain one when it proves nothing
                     vcost[n] = FIXED_SCALE * run_s[n] + (1.0 - P_LIM) * vcost[n]
+    vcost6 = dict(vcost)  # what v6 expects a replay to cost: its rules for "cheap" are kept
+    iso = None
+    n_ds = None
+    if replays and ISO:
+        n_ds = ctx["num_of"].get(replay.T_TPCDS)
+        if n_ds in replays:
+            iso = iso_target(A, base, skip_exec_ok)
+            if iso is not None and FIXED_SCALE * iso[1] > ISO_MAX_SHARE * vcost[n_ds]:
+                iso = None  # too many queries are reached: the plain replay costs about the same
+            if iso is not None:  # the isolated replay, then the plain one when it proves nothing
+                vcost[n_ds] = FIXED_SCALE * iso[1] + (1.0 - P_ISO) * vcost[n_ds]
     for n in cands:
         if n not in vcost:
             vcost[n] = costs.run(n)
@@ -558,23 +660,36 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
             # are exact). Other unverified huge tests are dropped only on broad evidence;
             # with few tests behind the probe, a replayable one is replayed in full instead.
             broad = len(run) >= MIN_PROBE_TESTS
-            now = [n for n in rep if vcost[n] <= REPLAY_CHEAP_S * FIXED_SCALE or not broad]
-            differ = run_replay(A, now, id_of, cid, base, skip_exec_ok, sum(vcost[n] for n in now), lim)
+            now = [n for n in rep if vcost6.get(n, vcost[n]) <= REPLAY_CHEAP_S * FIXED_SCALE or not broad]
+            differ = run_replay(A, now, id_of, cid, base, skip_exec_ok, sum(vcost[n] for n in now), lim, iso)
             rest = (keep | set(rep)) - set(now)
             # (never a reader of a changed fixture: the probe says nothing about data)
             huge = {n for n in rest - fixed if dsec[n] > HUGE_S} if broad else set()
-            return (rest - huge) | differ, why + f" | probe: never visible -> {len(huge)} huge dropped"
+            note = ""
+            if huge and ISO:
+                # v7: the heuristic is about to drop these unverified. Where a cheap isolated
+                # replay can speak for test_execute_tpcds, it is asked: a proof replaces the
+                # heuristic, and a query that no longer reproduces its baseline keeps the test.
+                alone = len(huge)
+                if iso is not None and n_ds in huge and iso[1] <= ISO_HEUR_MAX_S:
+                    verdict = iso_replay(A, cid, base, skip_exec_ok, iso)
+                    if verdict == "diff":
+                        huge.discard(n_ds)
+                    if verdict != "unknown":
+                        alone -= 1
+                note = f" ({alone} on the heuristic alone)"
+            return (rest - huge) | differ, why + f" | probe: never visible -> {len(huge)} huge dropped" + note
         if aborted:
             # nothing is known about the tests yet, except that failures are now likely
-            differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est, lim)
+            differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est, lim, iso)
             verify2, keep2, _, why2 = plan(set(run), keep | differ, vcost, costs, set(), dms, GAIN_VISIBLE)
             if not verify2:
                 return keep2, why + " | visible: " + why2
             failing, _, _ = do_run(sorted(verify2), None, False)
             return keep2 | failing, why + " | visible: " + why2
-        differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est, lim)
+        differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est, lim, iso)
         return keep | failing | differ, why
-    differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est, lim)
+    differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est, lim, iso)
     if not run:
         return keep | differ, why
     if differ:

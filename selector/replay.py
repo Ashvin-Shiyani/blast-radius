@@ -127,15 +127,21 @@ class _Slow(BaseException):
 
 
 STEP_LIMIT_S = 4.0  # one query's step takes well under a second at the pinned commit
+# v7: a per-query CPU limit beside the wall limit: a few times what the query took alone at
+# the pinned commit when the image was built, plus a constant. A change that makes one query
+# explode is given up after that, not after STEP_LIMIT_S.
+CPU_LIMIT_FACTOR = 4.0
+CPU_LIMIT_SLACK_S = 0.5
 _tick_on = False
 
 
-def _tick(seconds: float = STEP_LIMIT_S) -> None:
+def _tick(seconds: float = STEP_LIMIT_S, cpu: float | None = None) -> None:
     """Re-arm the watchdog: a step that runs longer raises _Slow (a hang is a failure)."""
     if _tick_on:
         import signal
 
         signal.setitimer(signal.ITIMER_REAL, seconds)
+        signal.setitimer(signal.ITIMER_PROF, cpu or 0.0)
 
 
 def _arm() -> None:
@@ -146,6 +152,7 @@ def _arm() -> None:
         raise _Slow()
 
     signal.signal(signal.SIGALRM, _late)
+    signal.signal(signal.SIGPROF, _late)
     _tick_on = True
 
 
@@ -155,6 +162,7 @@ def _disarm() -> None:
         import signal
 
         signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.setitimer(signal.ITIMER_PROF, 0)
     _tick_on = False
 
 
@@ -203,13 +211,15 @@ def _load_tables(te, tpch: bool) -> None:
 
 
 def _exec_test(tpch: bool, base: list | None, skip_exec_ok: bool, log=None, only=None, window=None,
-               stop=None):
+               stop=None, limits=None, strict_trees: bool = False):
     """Mirror of TestExecutor._mp_execute + subtestHelper for one TPC suite.
 
     Returns the per-query records when `base` is None (building), else True/False (same?).
     `only`: process just these queries (reach-limited replay). `window(i)` / `window(None)` is
     called when the work for query i starts / ends (build-time tracing). `stop()` is asked
-    before each query; a true answer ends the run as "not the same"."""
+    before each query; a true answer ends the run as "not the same". `limits[i]`: CPU seconds
+    allowed to one step of query i (None: the wall limit alone). `strict_trees`: a tree that
+    differs from the pinned one ends the run as "not the same" (the executor is not tried)."""
     import tests.test_executor as te
     import sqlglot.executor as ex
     from sqlglot import parse_one, transpile
@@ -223,6 +233,9 @@ def _exec_test(tpch: bool, base: list | None, skip_exec_ok: bool, log=None, only
     real_plan = ex.Plan
     state = {"tables": None}
     fail = object()
+
+    def lim(i):
+        return limits[i] if limits is not None else None
 
     def real_tables():
         if state["tables"] is None:
@@ -265,10 +278,10 @@ def _exec_test(tpch: bool, base: list | None, skip_exec_ok: bool, log=None, only
                 ex.Plan = real_plan
             if b is not None and fp_opt == b[0]:
                 return (fp_opt, duck, b[2])
-            if stop is not None and stop():
+            if strict_trees or (stop is not None and stop()):
                 return fail
         te.initializer(schema, real_tables())
-        _tick()
+        _tick(STEP_LIMIT_S, lim(i))
         table = te.mp_execute(expression, meta)
         if table is None:
             return fail
@@ -287,7 +300,7 @@ def _exec_test(tpch: bool, base: list | None, skip_exec_ok: bool, log=None, only
         if only is not None and i not in only:
             blobs.append(None)
             continue
-        _tick()
+        _tick(STEP_LIMIT_S, lim(i))
         enter(i)
         try:
             blobs.append(pickle.dumps(parse_one(sql)))
@@ -299,7 +312,7 @@ def _exec_test(tpch: bool, base: list | None, skip_exec_ok: bool, log=None, only
             continue
         if stop is not None and stop():
             return False
-        _tick()
+        _tick(STEP_LIMIT_S, lim(i))
         enter(i)
         try:
             rec = one(i, meta, sql, blobs[i])
@@ -341,10 +354,11 @@ def _opt_tpch(base: list | None, log=None, only=None, window=None, stop=None):
     return records if base is None else True
 
 
-def run_one(test_id: str, base, skip_exec_ok: bool = False, log=None, only=None, window=None, stop=None):
+def run_one(test_id: str, base, skip_exec_ok: bool = False, log=None, only=None, window=None, stop=None,
+            limits=None, strict_trees: bool = False):
     if test_id == T_OPT_TPCH:
         return _opt_tpch(base, log, only, window, stop)
-    return _exec_test(test_id == T_TPCH, base, skip_exec_ok, log, only, window, stop)
+    return _exec_test(test_id == T_TPCH, base, skip_exec_ok, log, only, window, stop, limits, strict_trees)
 
 
 def check_limited(test_ids: list[str], base: dict, skip_exec_ok: bool, only: dict, pstate: dict,
@@ -422,7 +436,8 @@ def reach_of(base: dict, path: str, lo: int, hi: int, test_ids: list[str]) -> di
     return out
 
 
-def check(test_ids: list[str], base: dict, skip_exec_ok: bool, log=None, only: dict | None = None) -> dict[str, bool]:
+def check(test_ids: list[str], base: dict, skip_exec_ok: bool, log=None, only: dict | None = None,
+          timed: bool = False) -> dict[str, bool]:
     """{test id: True if provably the pinned verdict}. Runs inside a process whose cwd and
     sys.path[0] are the patched tree, with SKIP_INTEGRATION=0."""
     out: dict[str, bool] = {}
@@ -436,7 +451,8 @@ def check(test_ids: list[str], base: dict, skip_exec_ok: bool, log=None, only: d
             try:
                 # (`only` is used by the audit of reach-limited replays alone, never for a verdict)
                 out[tid] = run_one(tid, b, skip_exec_ok, log,
-                                   only=None if only is None else set(only.get(tid, ()))) is True
+                                   only=None if only is None else set(only.get(tid, ())),
+                                   limits=cpu_limits(base, tid) if timed else None) is True
             except BaseException as exc:  # noqa: BLE001 - any failure means "not the same"
                 if log:
                     log(f"replay: {tid.rsplit('::', 1)[-1]} raised {type(exc).__name__}")
@@ -459,6 +475,411 @@ def exec_lines_touched(base: dict, changes) -> bool:
             if a <= hi and lo <= b:
                 return True
     return False
+
+
+# ---------------------------------------------------------------- isolated replay (v7)
+#
+# For a change confined to function-body lines L, only the TPC-DS queries whose processing
+# runs L at the pinned commit can behave differently, PROVIDED such a query leaves nothing
+# behind that another query reads. The isolated replay runs each of those queries alone, in a
+# fork made right after set-up (the state the reach map's "fresh" arrangement was recorded
+# from, and the state every pool worker of the real test starts from), and requires of each:
+# its baseline result, no time-out, and the same signature of what the run leaves behind as
+# the pinned code left when the image was built:
+#   (1) every object created during the run and still alive after a collection: its type and
+#       its content two levels deep (atoms by value);
+#   (2) every change the run made to the module-level and class-level state of sqlglot's
+#       modules: containers two levels deep, atoms by value, function defaults and closure
+#       cells, attributes of module-level instances, lru_cache statistics;
+#   (3) the TPC tables: the same row objects in the same order.
+# A query that reads a memoised result runs the memoised code itself when it runs alone, so
+# it is among the queries that reach L: caches need no signature. Anything that does not
+# match is "not proven", and the caller does what v6 does.
+
+import enum as _enum
+import functools as _functools
+
+_ATOMS = frozenset((str, int, float, bool, type(None), bytes, complex))
+_FUNC = type(lambda: 0)
+_LRU = type(_functools.lru_cache(maxsize=None)(lambda: 0))
+_MODULE = type(sys)
+ISO_MAX_SURVIVORS = 200000
+
+
+def cpu_limits(base: dict, tid: str, mode: str | None = None) -> list | None:
+    """CPU seconds allowed to one step of each query of `tid`, from the times of the isolated
+    runs at image build (trees + executor, or one `mode`); None when nothing was recorded."""
+    t = (base.get("iso") or {}).get("t", {}).get(tid)
+    n = len(base.get("tests", {}).get(tid) or ())
+    if not t or len(t.get("trees") or ()) != n or len(t.get("full") or ()) != n:
+        return None
+    out = []
+    for a, b in zip(t["trees"], t["full"]):
+        if a is None or b is None:
+            out.append(None)
+        else:
+            x = a + b if mode is None else (a if mode == "trees" else b)
+            out.append(CPU_LIMIT_FACTOR * x + CPU_LIMIT_SLACK_S)
+    return out
+
+
+def _d(v, depth: int) -> str:
+    """Canonical descriptor of a value: atoms by value; containers, functions and instances of
+    sqlglot's classes `depth` levels deep; everything else by type. No ids, no hash order."""
+    t = type(v)
+    if t in _ATOMS:
+        if t is int and not -2147483648 <= v <= 2147483647:
+            return "int:big"  # ids and hashes: they differ from process to process
+        return f"{t.__name__}:{v!r}"
+    if t is tuple or t is list:
+        if depth <= 0:
+            return f"{t.__name__}#{len(v)}"
+        return f"{t.__name__}[" + ",".join([_d(x, depth - 1) for x in v]) + "]"
+    if t is dict:
+        if depth <= 0:
+            return f"dict#{len(v)}"
+        return "dict{" + ",".join(sorted([_d(k, depth - 1) + "=" + _d(x, depth - 1) for k, x in v.items()])) + "}"
+    if t is set or t is frozenset:
+        if depth <= 0:
+            return f"{t.__name__}#{len(v)}"
+        return f"{t.__name__}{{" + ",".join(sorted([_d(x, depth - 1) for x in v])) + "}"
+    if isinstance(v, type):
+        return f"class:{v.__module__}.{v.__qualname__}"
+    mod = str(getattr(t, "__module__", "?"))
+    name = f"{mod}.{t.__qualname__}"
+    if t is _FUNC:
+        s = f"fn:{v.__module__}.{v.__qualname__}"
+        if depth > 0:
+            if v.__defaults__:
+                s += "|d=" + _d(v.__defaults__, depth)
+            if v.__kwdefaults__:
+                s += "|k=" + _d(v.__kwdefaults__, depth)
+            if v.__closure__:
+                cells = []
+                for c in v.__closure__:
+                    try:
+                        cells.append(_d(c.cell_contents, depth - 1))
+                    except ValueError:
+                        cells.append("empty")
+                s += "|c=" + ",".join(cells)
+        return s
+    if t is staticmethod or t is classmethod:
+        return f"{t.__name__}:" + _d(v.__func__, depth)
+    if t is property:
+        return "property:" + _d(v.fget, depth)
+    if t is _LRU:
+        try:
+            return f"lru:{getattr(v, '__qualname__', '?')}:{tuple(v.cache_info())!r}"
+        except Exception:  # noqa: BLE001
+            return name
+    if isinstance(v, _enum.Enum):
+        return f"enum:{name}.{v.name}"
+    if t is _MODULE:
+        return f"module:{getattr(v, '__name__', '?')}"
+    if depth > 0 and (mod.startswith("sqlglot") or mod.startswith("tests")):
+        d = getattr(v, "__dict__", None)
+        if type(d) is dict:
+            return name + "{" + ",".join(sorted([f"{k}={_d(x, depth - 1)}" for k, x in d.items()])) + "}"
+    return name
+
+
+def _ours(name) -> bool:
+    return isinstance(name, str) and (name == "sqlglot" or name.startswith("sqlglot.")
+                                      or name == "tests" or name.startswith("tests."))
+
+
+def _static_parts() -> dict[str, str]:
+    """{name path: descriptor} of the module-level and class-level state of sqlglot's modules
+    and of the tests' modules (dunder names apart)."""
+    out: dict[str, str] = {}
+    seen: set[int] = set()
+
+    def put(path: str, v) -> None:
+        if path in out:
+            k = 2
+            while f"{path}#{k}" in out:
+                k += 1
+            path = f"{path}#{k}"
+        out[path] = _d(v, 2)
+
+    def walk(owner: str, d) -> None:
+        for k in sorted(d):
+            if k[:2] == "__" and k[-2:] == "__":
+                continue
+            v = d[k]
+            put(f"{owner}.{k}", v)
+            if isinstance(v, type) and id(v) not in seen and _ours(getattr(v, "__module__", None)):
+                seen.add(id(v))
+                walk(f"{v.__module__}.{v.__qualname__}", vars(v))
+
+    for name in sorted(sys.modules):
+        if _ours(name):
+            d = getattr(sys.modules[name], "__dict__", None)
+            if type(d) is dict:
+                walk(name, dict(d))
+    return out
+
+
+def _tables_fp(tables) -> tuple:
+    """The identity of every table and of every row object, in order: rows are tuples of atoms,
+    so the same row objects in the same order are the same rows. Compared inside one family
+    of forks only (before and after a query)."""
+    if not isinstance(tables, dict):
+        return ("?", repr(type(tables)))
+    return tuple((name, id(t), id(t.rows), len(t.rows), hash(tuple(map(id, t.rows))))
+                 for name, t in tables.items())
+
+
+def _tables_desc(tables) -> list[str]:
+    """Every table's attributes but its rows (columns, range, readers and what they hold)."""
+    return [f"table:{name}=" + ",".join(sorted([f"{k}={_d(x, 2)}" for k, x in vars(t).items() if k != "rows"]))
+            for name, t in tables.items()]
+
+
+def _sig(surv: str, delta: dict, skip) -> str:
+    """One signature from the survivors' digest and the changed static paths, leaving out the
+    paths whose value depends on the hash seed at the pinned commit (found at image build)."""
+    m = hashlib.sha1(surv.encode())
+    for path in sorted(delta):
+        if path not in skip:
+            m.update(f"{path}={delta[path]}\0".encode("utf-8", "surrogatepass"))
+    return m.hexdigest()[:20]
+
+
+def _leftover(static0: dict, tables, tables0, dump: str | None = None):
+    """What this process did since gc.freeze() (see the head of this section): (digest of the
+    surviving objects, {changed static path: digest of its new value}), or None."""
+    import gc
+
+    gc.collect()
+    objs = gc.get_objects()
+    if len(objs) > ISO_MAX_SURVIVORS:
+        return None
+    if tables0 is not None and _tables_fp(tables) != tables0:
+        return None
+    # the namespaces of modules and classes created during the run are described by name path
+    # below (the static part), where seed-dependent and path-dependent names can be left out
+    ns: set[int] = set()
+    for mod in list(sys.modules.values()):
+        d = getattr(mod, "__dict__", None)
+        if type(d) is dict:
+            ns.add(id(d))
+    for o in objs:
+        if isinstance(o, type):
+            for r in gc.get_referents(o):
+                if type(r) is dict:
+                    ns.add(id(r))
+    parts = sorted(["namespace" if type(o) is dict and id(o) in ns else _d(o, 2) for o in objs])
+    del objs
+    if tables0 is not None:
+        parts += _tables_desc(tables)
+    delta: dict[str, str] = {}
+    full: list[str] = []
+    now = _static_parts()
+    for path, desc in now.items():
+        if static0.get(path) != hash(desc):
+            delta[path] = hashlib.sha1(desc.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+            if dump:
+                full.append(f"{path}={desc}")
+    for path in static0:
+        if path not in now:
+            delta[path] = "<gone>"
+    m = hashlib.sha1()
+    m.update(f"{len(parts)}".encode())
+    for p in parts:
+        m.update(p.encode("utf-8", "surrogatepass"))
+        m.update(b"\0")
+    if dump:
+        with open(dump, "w", encoding="utf-8", errors="surrogatepass") as fh:
+            fh.write("\n".join(parts) + "\n--- static delta\n" + "\n".join(sorted(full)) + "\n")
+    return m.hexdigest()[:20], delta
+
+
+def _iso_one(tid: str, i: int, b, skip_exec_ok: bool, limits, static0: dict, tables, tables0, skip) -> list:
+    """In a fork of its own: query i alone. [reproduces its baseline, signature, CPU s, notes];
+    with skip None (image build) the signature is the raw pair of _leftover."""
+    import gc
+    import time
+
+    gc.collect()
+    gc.freeze()  # everything alive now is the post-set-up state: collections and get_objects skip it
+    notes: list[str] = []
+    t0 = time.process_time()
+    _arm()
+    try:
+        ok = run_one(tid, b, skip_exec_ok, notes.append, only={i}, limits=limits, strict_trees=True) is True
+    except BaseException as exc:  # noqa: BLE001 - any failure means "not proven"
+        ok = False
+        notes.append(f"raised {type(exc).__name__}")
+    finally:
+        _disarm()
+    dt = time.process_time() - t0
+    sig = None
+    if ok:
+        dump = os.environ.get("BR_ISO_DUMP")
+        sig = _leftover(static0, tables, tables0,
+                        os.path.join(dump, f"q{i}-{'t' if skip_exec_ok else 'f'}-{os.getppid()}.txt") if dump else None)
+        if sig is not None and skip is not None:
+            sig = _sig(sig[0], sig[1], skip)
+    return [ok, sig, round(dt, 4), notes]
+
+
+def iso_run(base: dict, skip_exec_ok: bool, queries, log=None, record: bool = False):
+    """Isolated replay of the given TPC-DS queries on the tree this process imports from.
+
+    record=False: "same" when every query, alone, reproduces its baseline and leaves the
+    signature recorded at the pinned commit; "diff" when a query does not reproduce its
+    baseline (a result differs, an exception, a time-out); "unknown" otherwise (a signature
+    is missing or differs: nothing is known about the queries that were not run).
+    record=True (image build, pinned tree): {query: [reproduced, signature, CPU seconds]}."""
+    tid = T_TPCDS
+    b = base.get("tests", {}).get(tid)
+    mode = "trees" if skip_exec_ok else "full"
+    sigs = limits = skip = None
+    if b is None:
+        return "unknown"
+    if not record:
+        skip = frozenset((base.get("iso") or {}).get("skip") or ())
+        sigs = (base.get("iso") or {}).get("sig", {}).get(tid, {}).get(mode)
+        if not sigs or len(sigs) != len(b) or not queries or any(
+                not (0 <= i < len(b)) or sigs[i] is None for i in queries):
+            if log:
+                log("iso: no recorded signature for a reached query")
+            return "unknown"
+        limits = cpu_limits(base, tid, mode)
+    _arm()
+    try:
+        _tick(30.0)
+        import tests.test_executor as te
+
+        tables = tables0 = None
+        if not skip_exec_ok:
+            if "tpcds" not in _LOADED:
+                _load_tables(te, False)
+            tables = te.TestExecutor.tpcds_tables
+            tables0 = _tables_fp(tables)
+        static0 = {path: hash(desc) for path, desc in _static_parts().items()}
+    except BaseException as exc:  # noqa: BLE001
+        if log:
+            log(f"iso: set-up raised {type(exc).__name__}")
+        return "diff"
+    finally:
+        _disarm()
+    out: dict = {}
+    for i in queries:
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                os.close(r)
+                res = _iso_one(tid, i, b, skip_exec_ok, limits, static0, tables, tables0, skip)
+                with os.fdopen(w, "w") as fh:
+                    json.dump(res, fh)
+                code = 0
+            finally:
+                os._exit(code)
+        os.close(w)
+        with os.fdopen(r) as fh:
+            text = fh.read()
+        _, status = os.waitpid(pid, 0)
+        res = None
+        if status == 0 and text:
+            try:
+                res = json.loads(text)
+            except ValueError:
+                res = None
+        if record:
+            out[i] = res[:3] if res else None
+            continue
+        if res is None or res[0] is not True:
+            if log:
+                log(f"iso: query {i} does not reproduce its baseline"
+                    + (f" ({'; '.join(res[3])[:80]})" if res and res[3] else ""))
+            return "diff"
+        if res[1] is None or res[1] != sigs[i]:
+            if log:
+                log(f"iso: query {i} leaves a different state behind")
+            return "unknown"
+    if record:
+        return out
+    if log:
+        log(f"iso: {len(queries)} queries alone: baseline results, recorded signatures")
+    return "same"
+
+
+def _iso_build_child(repo: str, out_path: str, base_path: str, mode: str, tmpdir: str) -> None:
+    """Record the isolated run of every TPC-DS query at the pinned commit, through the code and
+    the kind of process the selector uses (warm parent, overlay, forked replay child)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import warm
+    from runner import build_overlay
+
+    with open(base_path, encoding="utf-8") as fh:
+        base = json.load(fh)
+    n = len(base["tests"][T_TPCDS])
+    overlay = os.path.join(tmpdir, f"ov-{mode}-{os.getpid()}")
+    build_overlay(repo, overlay, {})
+    res, notes = warm.replay_check(overlay, [T_TPCDS], base, mode == "trees", tmpdir, 1200.0,
+                                   iso=list(range(n)), record=True)
+    got = res.get("iso")
+    if not isinstance(got, dict):
+        raise RuntimeError(f"iso recording: no result ({notes})")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(got, fh)
+
+
+def build_iso(repo: str, base_path: str, tmpdir: str) -> dict:
+    """The "iso" section of the baseline file: per TPC-DS query and mode (trees / with the
+    executor), the leftover signature of its isolated run (None unless two processes with
+    different hash seeds reproduce the baseline and agree on it) and its CPU seconds."""
+    import subprocess
+
+    with open(base_path, encoding="utf-8") as fh:
+        n = len(json.load(fh)["tests"][T_TPCDS])
+    out: dict = {"t": {T_TPCDS: {}}, "sig": {T_TPCDS: {}}, "skip": []}
+    recs: dict = {}
+    for mode in ("trees", "full"):
+        procs = []
+        for seed in ("1", "777"):
+            op = os.path.join(tmpdir, f"iso-{mode}-{seed}.json")
+            env = dict(os.environ, PYTHONHASHSEED=seed, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1")
+            procs.append((subprocess.Popen([sys.executable, os.path.abspath(__file__), "_iso", repo, op,
+                                            base_path, mode, tmpdir], env=env), op))
+        runs = []
+        for proc, op in procs:
+            if proc.wait() != 0:
+                raise RuntimeError("iso recording failed")
+            with open(op, encoding="utf-8") as fh:
+                runs.append(json.load(fh))
+        recs[mode] = runs
+    # static paths whose value differs between the two hash seeds in any query's run: their
+    # value is arbitrary at the pinned commit too (e.g. a loop variable over a set left in a
+    # class body), so no signature includes them
+    skip: set[str] = set()
+    for mode, runs in recs.items():
+        for i in range(n):
+            x, y = runs[0].get(str(i)), runs[1].get(str(i))
+            if x and y and x[0] is True and y[0] is True and x[1] and y[1]:
+                dx, dy = x[1][1], y[1][1]
+                skip.update(p for p in set(dx) | set(dy) if dx.get(p) != dy.get(p))
+    out["skip"] = sorted(skip)
+    for mode, runs in recs.items():
+        sig, secs = [], []
+        for i in range(n):
+            x, y = runs[0].get(str(i)), runs[1].get(str(i))
+            good = bool(x and y and x[0] is True and y[0] is True and x[1] and y[1])
+            sx = _sig(x[1][0], x[1][1], skip) if good else None
+            sig.append(sx if good and sx == _sig(y[1][0], y[1][1], skip) else None)
+            secs.append(round(max(x[2], y[2]), 4) if x and y else None)
+        out["sig"][T_TPCDS][mode] = sig
+        out["t"][T_TPCDS][mode] = secs
+        print(f"replay iso: {mode}: {sum(s is not None for s in sig)}/{n} queries with a stable signature, "
+              f"{sum(t for t in secs if t):.2f}s cpu alone", file=sys.stderr)
+    print(f"replay iso: {len(skip)} seed-dependent static paths left out: {sorted(skip)[:8]}", file=sys.stderr)
+    return out
 
 
 # ---------------------------------------------------------------- build time
@@ -841,6 +1262,12 @@ def build(repo: str, out_path: str) -> None:
         doc["reach"] = finish_reach(reach_procs)
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, separators=(",", ":"))
+    try:
+        doc["iso"] = build_iso(repo, out_path, tmpdir)
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, separators=(",", ":"))
+    except Exception as exc:  # noqa: BLE001 - without it the selector does what v6 does
+        print(f"replay iso: recording failed ({exc!r}): no isolated replays", file=sys.stderr)
     import shutil
 
     shutil.rmtree(tmpdir, ignore_errors=True)
@@ -861,6 +1288,17 @@ if __name__ == "__main__":
         with open(sys.argv[3], encoding="utf-8") as fh:
             _doc = json.load(fh)
         _doc["reach"] = build_reach(os.path.abspath(sys.argv[2]), tempfile.mkdtemp(prefix="reach-build-"))
+        with open(sys.argv[4], "w", encoding="utf-8") as fh:
+            json.dump(_doc, fh, separators=(",", ":"))
+    elif sys.argv[1] == "_iso":
+        _iso_build_child(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])
+    elif sys.argv[1] == "iso":  # add the isolated-run records to an existing baseline file
+        import tempfile
+
+        with open(sys.argv[3], encoding="utf-8") as fh:
+            _doc = json.load(fh)
+        _doc["iso"] = build_iso(os.path.abspath(sys.argv[2]), os.path.abspath(sys.argv[3]),
+                                tempfile.mkdtemp(prefix="iso-build-"))
         with open(sys.argv[4], "w", encoding="utf-8") as fh:
             json.dump(_doc, fh, separators=(",", ":"))
     elif sys.argv[1] == "build":

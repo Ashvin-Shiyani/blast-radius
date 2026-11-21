@@ -273,9 +273,13 @@ def check_imports(overlay: str, modules: list[str], workdir: str, timeout_s: flo
 
 
 def replay_check(overlay: str, test_ids: list[str], base: dict, skip_exec_ok: bool, workdir: str,
-                 timeout_s: float, limited: dict | None = None, only: dict | None = None) -> tuple[dict[str, bool], list[str]]:
+                 timeout_s: float, limited: dict | None = None, only: dict | None = None,
+                 iso: list | None = None, record: bool = False, timed: bool = False) -> tuple[dict, list[str]]:
     """Run replay.check on the patched overlay in a forked child. Returns ({test id: same?},
-    log lines); every test is False when the child timed out or died."""
+    log lines); every test is False when the child timed out or died. `iso`: run the isolated
+    replay of these TPC-DS queries instead (replay.iso_run); its verdict ("same" / "diff" /
+    "unknown"), or with `record` its recordings, is returned under the key "iso". `timed`: the
+    plain replay runs under the per-query CPU limits."""
     warm_up()
     out = os.path.join(workdir, f"rep-{os.getpid()}-{time.monotonic_ns()}.json")
     sys.stdout.flush()
@@ -300,7 +304,11 @@ def replay_check(overlay: str, test_ids: list[str], base: dict, skip_exec_ok: bo
             import replay
 
             notes: list[str] = []
-            if limited is not None:
+            extra = None
+            if iso is not None:
+                extra = replay.iso_run(base, skip_exec_ok, iso, notes.append, record=record)
+                res = {t: extra == "same" for t in test_ids}
+            elif limited is not None:
                 # reach-limited replay: the overlay's changed expression is probed, and only
                 # the queries that reach it are run (see replay.check_limited)
                 import probe
@@ -309,9 +317,9 @@ def replay_check(overlay: str, test_ids: list[str], base: dict, skip_exec_ok: bo
                                           notes.append)
                 res = {t: ok for t in test_ids}
             else:
-                res = replay.check(test_ids, base, skip_exec_ok, notes.append, only)
+                res = replay.check(test_ids, base, skip_exec_ok, notes.append, only, timed=timed)
             with open(out, "w") as fh:
-                json.dump({"res": res, "notes": notes}, fh)
+                json.dump({"res": res, "notes": notes, "iso": extra}, fh)
         except BaseException:  # noqa: BLE001
             code = 1
         os._exit(code)
@@ -330,7 +338,9 @@ def replay_check(overlay: str, test_ids: list[str], base: dict, skip_exec_ok: bo
     except BaseException:
         _kill(pid)
         raise
-    res = {t: False for t in test_ids}
+    res: dict = {t: False for t in test_ids}
+    if iso is not None:
+        res["iso"] = "diff" if timed_out else "unknown"  # a hang is a failure; no result is no proof
     notes = ["replay: timed out"] if timed_out else []
     if not timed_out:
         try:
@@ -340,6 +350,8 @@ def replay_check(overlay: str, test_ids: list[str], base: dict, skip_exec_ok: bo
                 if t in res:
                     res[t] = ok is True
             notes = list(d.get("notes", []))
+            if iso is not None and d.get("iso") is not None:
+                res["iso"] = d["iso"]
         except (OSError, ValueError):
             notes = ["replay: no result"]
     try:
