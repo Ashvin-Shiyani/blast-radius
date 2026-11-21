@@ -331,12 +331,48 @@ def docstring_only(old_tok, new_tok, old_src: str, new_src: str) -> bool:
     return a == b
 
 
-def _rule_for_old_line(path: str, ln: int, span, sc: FileScopes, M: Map) -> tuple[set[int], str]:
+def _lambda_confined(old_src: str, new_src: str, sc: FileScopes, ln: int, span) -> bool:
+    """True if the original and the patched module differ only inside the body of one lambda:
+    the innermost one whose body holds the changed columns of line `ln`. Proven on the syntax
+    trees: with that body blanked in both, the two modules are identical. Importing the module
+    then builds the same objects as before (only that function's code differs), so the change
+    can be observed only by running the lambda's body."""
+    if span is None:
+        return False
+    best = None
+    for (l0, c0, l1, c1) in sc.lambdas:
+        if (l0, c0) <= (ln, span[0]) and (ln, span[1]) <= (l1, c1):
+            if best is None or (l1 - l0, c1 - c0) < (best[2] - best[0], best[3] - best[1]):
+                best = (l0, c0, l1, c1)
+    if best is None:
+        return False
+    try:
+        trees = [ast.parse(old_src), ast.parse(new_src)]
+    except (SyntaxError, ValueError):
+        return False
+    for tree in trees:
+        found = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Lambda) and (node.body.lineno, node.body.col_offset) == (best[0], best[1]):
+                node.body = ast.Constant(value=None)
+                found += 1
+        if found != 1:
+            return False
+    return ast.dump(trees[0]) == ast.dump(trees[1])
+
+
+def _rule_for_old_line(path: str, ln: int, span, sc: FileScopes, M: Map,
+                       lambda_only: bool = False) -> tuple[set[int], str]:
     """Tests that can observe a change on line `ln` of the ORIGINAL file."""
     hit = M.rt_lines(path, ln, ln) | M.imp_lines(path, ln, ln)
     if span is not None:
         lam = sc.lambda_body_at(ln, *span)
         if lam is not None:
+            if lambda_only:
+                # (see _lambda_confined) tests that only execute the enclosing statement at
+                # import time, e.g. building a class-level dict of lambdas, cannot tell: the
+                # candidates are the tests that run function code on the lambda's lines
+                return M.rt_lines(path, lam[0], lam[1]), "lambda"
             return hit | M.rt_lines(path, lam[0], lam[1]), "lambda"
     f = sc.func_of(ln)
     if f is not None and f[2] <= ln <= f[1]:
@@ -491,7 +527,9 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     # 1. modified and removed lines, judged in the original file
     for ln in sorted(set(fc.removed)):
         span = _changed_span(old_lines[ln - 1], pairs[ln]) if ln in pairs else None
-        hit, kind = _rule_for_old_line(path, ln, span, sc, M)
+        lambda_only = (len(fc.removed) == 1 and len(fc.added_text) == 1
+                       and _lambda_confined(old_src, new_src, sc, ln, span))
+        hit, kind = _rule_for_old_line(path, ln, span, sc, M, lambda_only)
         A.cands |= hit
         A.notes.append(f"{path}:{ln} {kind} -> {len(hit)}")
         A.changes.append((path, kind.split("/")[0], *_runtime_range(path, ln, span, sc, kind)))
