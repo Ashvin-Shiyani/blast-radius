@@ -58,6 +58,21 @@ REPLAY_COST = {
 REPLAY_FULL_S = 8.3  # the same replay when it runs to its end (for time limits)
 REPLAY_CHEAP_S = 2.5  # replays at most this long also run when a probe says "invisible"
 
+# Reach-limited replay (replay.check_limited): only the queries whose processing runs the
+# changed expression are replayed, under a probe on that expression. Tried first when it is
+# expected to cost at most LIM_MAX_SHARE of the plain replay; the plain replay follows
+# whenever it proves nothing.
+REACH = os.environ.get("BR_REACH", "1") == "1"
+REACH_AUDIT = os.environ.get("BR_REACH_AUDIT", "0") == "1"  # run the plain replay too, log both
+REPLAY_RUN = {  # the plain replay when it runs to its end: (trees only, with the executor)
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": (1.5, 8.3),
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": (0.1, 0.1),
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch": (0.15, 0.15),
+}
+LIM_TABLES_S = float(os.environ.get("BR_LIM_TABLES", "0.3"))  # loading the TPC tables, part of a replay with the executor
+LIM_MAX_SHARE = float(os.environ.get("BR_LIM_SHARE", "0.6"))
+P_LIM = float(os.environ.get("BR_P_LIM", "0.5"))  # share of limited replays that prove "unchanged"
+
 MAP_DIR = os.path.dirname(MAP)
 COST = os.environ.get("BR_COST", os.path.join(MAP_DIR, "cost.json"))
 REPLAY = os.environ.get("BR_REPLAY", os.path.join(MAP_DIR, "replay.json"))
@@ -165,6 +180,53 @@ def make_probe(A, cid):
     except Exception as exc:  # noqa: BLE001
         log(f"{cid}: probe setup failed ({exc!r})")
         return None
+
+
+def reach_probe(A, cid, base, ids: list[str]):
+    """(path, probed source, report path, {test id: queries}) when a reach-limited replay can
+    speak for the replayed tests `ids`, else None. Needs: the patch is one 1:1 line
+    replacement in one file and nothing else; the change sits in an expression the strict
+    probe can watch (probe.instrument_wide); the reach map vouches for that expression's
+    lines (replay.reach_of); and at least one query reaches them."""
+    if base is None or not base.get("reach") or len(A.files) != 1 or A.code_opaque:
+        return None
+    target = probe_target(A, REPO)
+    if target is None:
+        return None
+    try:
+        import probe
+        import replay
+
+        path, lo, ln, span_o, span_n = target
+        if lo != ln or not path.startswith("sqlglot/"):
+            return None
+        with open(os.path.join(REPO, path), encoding="utf-8") as fh:
+            old_src = fh.read()
+        report = os.path.join(WORK, "probe-reach.txt")
+        got = probe.instrument_wide(old_src, A.new_sources[path], lo, ln, span_o, span_n, report)
+        if got is None:
+            return None
+        src, n_lo, n_hi = got
+        only = replay.reach_of(base, path, n_lo, n_hi, ids)
+        if only is None or not any(only.values()):
+            return None
+        return path, src, report, only
+    except Exception as exc:  # noqa: BLE001
+        log(f"{cid}: reach probe setup failed ({exc!r})")
+        return None
+
+
+def limited_cost(base, tid: str, queries: list[int], trees: bool) -> float:
+    """Expected CPU seconds (cost map's machine) of the reach-limited replay of one test."""
+    recs = base["tests"][tid]
+    heavy = [i for i, r in enumerate(recs) if r is not None]  # executed (or, optimized tpch: every) query
+    reached = len(set(queries) & set(heavy))
+    share = reached / len(heavy) if heavy else len(queries) / max(1, len(recs))
+    full_s = REPLAY_RUN[tid][0 if trees else 1]
+    if trees or not tid.endswith(("::test_execute_tpcds", "::test_execute_tpch")):
+        return full_s * share
+    tables = min(LIM_TABLES_S, full_s) if reached else 0.0
+    return tables + (full_s - min(LIM_TABLES_S, full_s)) * share
 
 
 class Costs:
@@ -334,13 +396,56 @@ def plan(verifiable: set[int], fixed_keep: set[int], vcost: dict[int, float], co
                                f"{static_ms / 1000:.1f}s")
 
 
-def run_replay(A, nums: list[int], id_of, cid: str, base: dict, skip_exec_ok: bool, est_s: float) -> set[int]:
+def limited_replay(A, nums: list[int], id_of, cid: str, base: dict, skip_exec_ok: bool, lim) -> bool:
+    """Reach-limited replay of the given tests (see replay.check_limited). True only when it
+    proves all of them unchanged."""
+    import warm
+    from runner import build_overlay
+
+    path, src, report, only = lim
+    ids = [id_of[n] for n in nums]
+    if not any(only.get(t) for t in ids):
+        return False
+    overlay = os.path.join(WORK, "ovl")
+    try:
+        files = patched_files(A, REPO)
+        files[path] = src.encode("utf-8")
+        if os.path.exists(report):
+            os.remove(report)
+        build_overlay(REPO, overlay, files)
+        import resource
+
+        r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        res, notes = warm.replay_check(overlay, ids, base, skip_exec_ok, WORK, 20 + 4 * REPLAY_FULL_S,
+                                       limited={t: list(only.get(t, ())) for t in ids})
+        r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        import probe
+
+        ok = all(res.get(t) is True for t in ids) and not probe.read_report(report)[2]
+        log(f"{cid}: reach cpu {r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime:.2f}s "
+            f"({'trees' if skip_exec_ok else 'full'}, {'+'.join(str(len(only.get(t, ()))) for t in ids)} queries): "
+            f"{'unchanged' if ok else 'not proven'}" + (f" | {'; '.join(notes)[:120]}" if notes else ""))
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        log(f"{cid}: reach-limited replay failed to run ({exc!r})")
+        return False
+    finally:
+        shutil.rmtree(overlay, ignore_errors=True)
+
+
+def run_replay(A, nums: list[int], id_of, cid: str, base: dict, skip_exec_ok: bool, est_s: float,
+               lim=None) -> set[int]:
     """Replay the given tests on the patched tree; returns those NOT proven unchanged."""
     import warm
     from runner import build_overlay
 
     if not nums:
         return set()
+    proven = False
+    if lim is not None:
+        proven = limited_replay(A, nums, id_of, cid, base, skip_exec_ok, lim)
+        if proven and not REACH_AUDIT:
+            return set()
     overlay = os.path.join(WORK, "ovr")
     try:
         build_overlay(REPO, overlay, patched_files(A, REPO))
@@ -354,10 +459,36 @@ def run_replay(A, nums: list[int], id_of, cid: str, base: dict, skip_exec_ok: bo
         log(f"{cid}: replay cpu {r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime:.2f}s "
             f"({'trees' if skip_exec_ok else 'full'}): {len(same)}/{len(nums)} unchanged"
             + (f" | {'; '.join(notes)[:120]}" if notes else ""))
-        return set(nums) - set(same)
+        if lim is not None and REACH_AUDIT:
+            log(f"{cid}: reach-audit limited={'same' if proven else 'no'} plain={len(same)}/{len(nums)}"
+                + (" DISAGREE" if proven and len(same) != len(nums) else ""))
+        if REACH_AUDIT:
+            # measurement only: what replaying just the reached queries, with no probe, would say
+            import replay
+
+            only: dict | None = {id_of[n]: set() for n in nums}
+            for path, kind, lo, hi in (A.changes if not A.code_opaque and len(A.files) == 1 else [("", "", 0, 0)]):
+                got = replay.reach_of(base, path, lo, hi, [id_of[n] for n in nums]) if kind in ("body", "lambda") else None
+                if got is None:
+                    only = None
+                    break
+                for t, qs in got.items():
+                    only[t].update(qs)
+            if only is None:
+                log(f"{cid}: reachonly-audit n/a plain={len(same)}/{len(nums)}")
+            else:
+                r2 = resource.getrusage(resource.RUSAGE_CHILDREN)
+                res2, _ = warm.replay_check(overlay, [id_of[n] for n in nums], base, skip_exec_ok, WORK,
+                                            20 + 4 * max(est_s, REPLAY_FULL_S), only={t: sorted(q) for t, q in only.items()})
+                r3 = resource.getrusage(resource.RUSAGE_CHILDREN)
+                same2 = sum(1 for n in nums if res2.get(id_of[n]) is True)
+                log(f"{cid}: reachonly-audit queries {'+'.join(str(len(only[id_of[n]])) for n in nums)} "
+                    f"cpu {r3.ru_utime + r3.ru_stime - r2.ru_utime - r2.ru_stime:.2f}s -> {same2}/{len(nums)} plain={len(same)}/{len(nums)}"
+                    + (" DISAGREE" if same2 != len(same) else ""))
+        return set() if proven else set(nums) - set(same)
     except Exception as exc:  # noqa: BLE001
         log(f"{cid}: replay failed to run ({exc!r}): keeping")
-        return set(nums)
+        return set() if proven else set(nums)
     finally:
         shutil.rmtree(overlay, ignore_errors=True)
 
@@ -386,6 +517,16 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
             if rc is not None and id_of[n] in base.get("tests", {}) and replay_valid(A, M, n):
                 replays.add(n)
                 vcost[n] = FIXED_SCALE * (rc[0] if skip_exec_ok else rc[1])
+    lim = None
+    if replays and REACH:
+        lim = reach_probe(A, cid, base, sorted(id_of[n] for n in replays))
+        if lim is not None:
+            run_s = {n: limited_cost(base, id_of[n], lim[3][id_of[n]], skip_exec_ok) for n in replays}
+            if FIXED_SCALE * sum(run_s.values()) > LIM_MAX_SHARE * sum(vcost[n] for n in replays):
+                lim = None  # nearly every query is reached: the plain replay costs the same
+            else:
+                for n in replays:  # the limited replay, then the plain one when it proves nothing
+                    vcost[n] = FIXED_SCALE * run_s[n] + (1.0 - P_LIM) * vcost[n]
     for n in cands:
         if n not in vcost:
             vcost[n] = costs.run(n)
@@ -418,22 +559,22 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
             # with few tests behind the probe, a replayable one is replayed in full instead.
             broad = len(run) >= MIN_PROBE_TESTS
             now = [n for n in rep if vcost[n] <= REPLAY_CHEAP_S * FIXED_SCALE or not broad]
-            differ = run_replay(A, now, id_of, cid, base, skip_exec_ok, sum(vcost[n] for n in now))
+            differ = run_replay(A, now, id_of, cid, base, skip_exec_ok, sum(vcost[n] for n in now), lim)
             rest = (keep | set(rep)) - set(now)
             # (never a reader of a changed fixture: the probe says nothing about data)
             huge = {n for n in rest - fixed if dsec[n] > HUGE_S} if broad else set()
             return (rest - huge) | differ, why + f" | probe: never visible -> {len(huge)} huge dropped"
         if aborted:
             # nothing is known about the tests yet, except that failures are now likely
-            differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est)
+            differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est, lim)
             verify2, keep2, _, why2 = plan(set(run), keep | differ, vcost, costs, set(), dms, GAIN_VISIBLE)
             if not verify2:
                 return keep2, why + " | visible: " + why2
             failing, _, _ = do_run(sorted(verify2), None, False)
             return keep2 | failing, why + " | visible: " + why2
-        differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est)
+        differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est, lim)
         return keep | failing | differ, why
-    differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est)
+    differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est, lim)
     if not run:
         return keep | differ, why
     if differ:

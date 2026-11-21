@@ -273,7 +273,7 @@ def check_imports(overlay: str, modules: list[str], workdir: str, timeout_s: flo
 
 
 def replay_check(overlay: str, test_ids: list[str], base: dict, skip_exec_ok: bool, workdir: str,
-                 timeout_s: float) -> tuple[dict[str, bool], list[str]]:
+                 timeout_s: float, limited: dict | None = None, only: dict | None = None) -> tuple[dict[str, bool], list[str]]:
     """Run replay.check on the patched overlay in a forked child. Returns ({test id: same?},
     log lines); every test is False when the child timed out or died."""
     warm_up()
@@ -300,7 +300,16 @@ def replay_check(overlay: str, test_ids: list[str], base: dict, skip_exec_ok: bo
             import replay
 
             notes: list[str] = []
-            res = replay.check(test_ids, base, skip_exec_ok, notes.append)
+            if limited is not None:
+                # reach-limited replay: the overlay's changed expression is probed, and only
+                # the queries that reach it are run (see replay.check_limited)
+                import probe
+
+                ok = replay.check_limited(test_ids, base, skip_exec_ok, limited, probe.install_strict(),
+                                          notes.append)
+                res = {t: ok for t in test_ids}
+            else:
+                res = replay.check(test_ids, base, skip_exec_ok, notes.append, only)
             with open(out, "w") as fh:
                 json.dump({"res": res, "notes": notes}, fh)
         except BaseException:  # noqa: BLE001

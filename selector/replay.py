@@ -168,10 +168,48 @@ def _rows_fp(table) -> str:
     return _h(_atom(list(cols)), *(_atom(r) for r in rows))
 
 
-def _exec_test(tpch: bool, base: list | None, skip_exec_ok: bool, log=None):
+_LOADED: set = set()  # suites whose tables this process has loaded (once, as in the test run)
+
+
+class _NoDuck:
+    """Stands in for the duckdb module while the test class loads its tables. The replay never
+    queries duckdb, and defining its lazy views is half of the loader's time."""
+
+    @staticmethod
+    def connect(*a, **k):
+        return _NoDuck()
+
+    def execute(self, *a, **k):
+        return self
+
+    def close(self):
+        pass
+
+
+def _load_tables(te, tpch: bool) -> None:
+    """The test class's own loader (setUpClass), unchanged, for the python tables: duckdb is
+    stubbed, and for TPC-DS the TPC-H tables (which that test never reads) are skipped."""
+    real_duck, real_schema = te.duckdb, te.TPCH_SCHEMA
+    te.duckdb = _NoDuck
+    if not tpch:
+        te.TPCH_SCHEMA = {}
+    try:
+        te.TestExecutor.setUpClass()
+    finally:
+        te.duckdb, te.TPCH_SCHEMA = real_duck, real_schema
+    _LOADED.add("tpcds")
+    if tpch:
+        _LOADED.add("tpch")
+
+
+def _exec_test(tpch: bool, base: list | None, skip_exec_ok: bool, log=None, only=None, window=None,
+               stop=None):
     """Mirror of TestExecutor._mp_execute + subtestHelper for one TPC suite.
 
-    Returns the per-query records when `base` is None (building), else True/False (same?)."""
+    Returns the per-query records when `base` is None (building), else True/False (same?).
+    `only`: process just these queries (reach-limited replay). `window(i)` / `window(None)` is
+    called when the work for query i starts / ends (build-time tracing). `stop()` is asked
+    before each query; a true answer ends the run as "not the same"."""
     import tests.test_executor as te
     import sqlglot.executor as ex
     from sqlglot import parse_one, transpile
@@ -184,37 +222,33 @@ def _exec_test(tpch: bool, base: list | None, skip_exec_ok: bool, log=None):
         return False
     real_plan = ex.Plan
     state = {"tables": None}
+    fail = object()
 
     def real_tables():
         if state["tables"] is None:
-            _tick(30.0)
-            cls.setUpClass()  # the test's own loader (duckdb only defines lazy views here)
+            if ("tpch" if tpch else "tpcds") not in _LOADED:
+                _tick(30.0)
+                _load_tables(te, tpch)
             state["tables"] = cls.tpch_tables if tpch else cls.tpcds_tables
         return state["tables"]
 
-    records = []
-    # the parent parses and pickles every query before any result is looked at
-    blobs = []
-    for meta, sql, _ in sqls:
-        _tick()
-        blobs.append(pickle.dumps(parse_one(sql)))
-    for i, (meta, sql, _) in enumerate(sqls):
-        _tick()
-        expression = pickle.loads(blobs[i])
+    def enter(i):
+        if window is not None:
+            window(i)
+
+    def one(i, meta, sql, blob):
+        expression = pickle.loads(blob)
         if not meta.get("execute"):
             te.initializer(schema, {})
-            if te.mp_execute(expression, meta) is not None:
-                return False
-            records.append(None)
-            continue
+            return fail if te.mp_execute(expression, meta) is not None else None
         b = base[i] if base is not None else None
         if base is not None and (b is None or b[0] is None or b[1] is None or b[2] is None):
-            return False  # no reproducible baseline for this query
+            return fail  # no reproducible baseline for this query
         duck = _h(transpile(sql, write="duckdb")[0])
         if b is not None and duck != b[1]:
             if log:
                 log(f"replay: query {i} duckdb sql differs")
-            return False
+            return fail
         fp_opt = None
         if base is None or skip_exec_ok:
             # the optimized tree handed to the planner, captured by stopping there
@@ -223,31 +257,61 @@ def _exec_test(tpch: bool, base: list | None, skip_exec_ok: bool, log=None):
             te.initializer(schema, {name: Table(columns=tuple(cols)) for name, cols in schema.items()})
             ex.Plan = _capture_plan
             try:
-                te.mp_execute(pickle.loads(blobs[i]), meta)
-                return False  # the planner was never reached: not the pinned pipeline
+                te.mp_execute(pickle.loads(blob), meta)
+                return fail  # the planner was never reached: not the pinned pipeline
             except _Captured as cap:
                 fp_opt = _h(canon(cap.args[0]))
             finally:
                 ex.Plan = real_plan
             if b is not None and fp_opt == b[0]:
-                records.append((fp_opt, duck, b[2]))
-                continue
+                return (fp_opt, duck, b[2])
+            if stop is not None and stop():
+                return fail
         te.initializer(schema, real_tables())
         _tick()
         table = te.mp_execute(expression, meta)
         if table is None:
-            return False
+            return fail
         table = pickle.loads(pickle.dumps(table))
         res = _rows_fp(table)
         if b is not None and res != b[2]:
             if log:
                 log(f"replay: query {i} rows differ")
+            return fail
+        return (fp_opt, duck, res)
+
+    records: list = []
+    # the parent parses and pickles every query before any result is looked at
+    blobs: list = []
+    for i, (meta, sql, _) in enumerate(sqls):
+        if only is not None and i not in only:
+            blobs.append(None)
+            continue
+        _tick()
+        enter(i)
+        try:
+            blobs.append(pickle.dumps(parse_one(sql)))
+        finally:
+            enter(None)
+    for i, (meta, sql, _) in enumerate(sqls):
+        if blobs[i] is None:
+            records.append(None)
+            continue
+        if stop is not None and stop():
             return False
-        records.append((fp_opt, duck, res))
+        _tick()
+        enter(i)
+        try:
+            rec = one(i, meta, sql, blobs[i])
+        finally:
+            enter(None)
+        if rec is fail:
+            return False
+        records.append(rec)
     return records if base is None else True
 
 
-def _opt_tpch(base: list | None, log=None):
+def _opt_tpch(base: list | None, log=None, only=None, window=None, stop=None):
     import tests.test_executor as te
     from sqlglot import transpile
 
@@ -256,8 +320,19 @@ def _opt_tpch(base: list | None, log=None):
         return False
     records = []
     for i, (_, sql, optimized) in enumerate(sqls):
+        if only is not None and i not in only:
+            records.append(None)
+            continue
+        if stop is not None and stop():
+            return False
         _tick()
-        fp = _h(transpile(sql, write="duckdb")[0], transpile(optimized, write="duckdb")[0])
+        if window is not None:
+            window(i)
+        try:
+            fp = _h(transpile(sql, write="duckdb")[0], transpile(optimized, write="duckdb")[0])
+        finally:
+            if window is not None:
+                window(None)
         if base is not None and (base[i] is None or fp != base[i]):
             if log:
                 log(f"replay: optimized tpch query {i} differs")
@@ -266,13 +341,88 @@ def _opt_tpch(base: list | None, log=None):
     return records if base is None else True
 
 
-def run_one(test_id: str, base, skip_exec_ok: bool = False, log=None):
+def run_one(test_id: str, base, skip_exec_ok: bool = False, log=None, only=None, window=None, stop=None):
     if test_id == T_OPT_TPCH:
-        return _opt_tpch(base, log)
-    return _exec_test(test_id == T_TPCH, base, skip_exec_ok, log)
+        return _opt_tpch(base, log, only, window, stop)
+    return _exec_test(test_id == T_TPCH, base, skip_exec_ok, log, only, window, stop)
 
 
-def check(test_ids: list[str], base: dict, skip_exec_ok: bool, log=None) -> dict[str, bool]:
+def check_limited(test_ids: list[str], base: dict, skip_exec_ok: bool, only: dict, pstate: dict,
+                  log=None) -> bool:
+    """Reach-limited replay of `test_ids` on a patched tree whose changed expression is probed.
+
+    `only[test id]` lists the queries whose processing runs the changed expression's lines at
+    the pinned commit (reach_of); no other query is run. True only if all of this holds:
+    importing the tree and the tests never evaluates the probed expression; every listed query
+    reproduces its baseline; the probed expression was evaluated at least once, and its old
+    and its new value were identical at every evaluation. Then every evaluation left the
+    program in the state the pinned code leaves it in, so the queries that were not run, which
+    never reach the expression, do what they do at the pinned commit."""
+    _arm()
+    try:
+        _tick(30.0)
+        import tests.test_executor  # noqa: F401
+
+        if pstate["n"]:
+            if log:
+                log("reach: the changed expression runs at import")
+            return False
+        for tid in test_ids:
+            b = base.get("tests", {}).get(tid)
+            if b is None:
+                return False
+            ok = run_one(tid, b, skip_exec_ok, log, only=set(only.get(tid, ())), stop=lambda: pstate["i"])
+            if pstate["i"]:
+                if log:
+                    log(f"reach: old and new value differ (evaluation {pstate['n']})")
+                return False
+            if ok is not True:
+                return False
+        if not pstate["n"]:
+            if log:
+                log("reach: the changed expression never ran")
+            return False
+        if log:
+            log(f"reach: {pstate['n']} evaluations, none differ")
+        return True
+    except BaseException as exc:  # noqa: BLE001 - any failure means "not proven"
+        if log:
+            log(f"reach: raised {type(exc).__name__}")
+        return False
+    finally:
+        _disarm()
+
+
+def reach_of(base: dict, path: str, lo: int, hi: int, test_ids: list[str]) -> dict | None:
+    """{test id: queries whose processing runs any of lines lo..hi of `path` at the pinned
+    commit}, from the build-time reach map. None when the map cannot vouch for it: one of the
+    lines also runs outside the per-query windows (import, set-up), or the set of queries that
+    run it differs between the recorded arrangements (it depends on what ran before)."""
+    rm = base.get("reach")
+    if not rm or lo <= 0 or hi < lo or not path.startswith("sqlglot/"):
+        return None
+
+    def hit(ranges) -> bool:
+        return any(a <= hi and lo <= b for a, b in ranges)
+
+    if hit(rm.get("outside", {}).get(path, ())):
+        return None
+    out = {}
+    for tid in test_ids:
+        n = rm.get("counts", {}).get(tid)
+        if n is None or tid not in rm.get("lines", {}) or n != len(base.get("tests", {}).get(tid) or ()):
+            return None
+        if hit(rm.get("unstable", {}).get(tid, {}).get(path, ())):
+            return None
+        mask = 0
+        for m, ranges in rm["lines"][tid].get(path, {}).items():
+            if hit(ranges):
+                mask |= int(m, 16)
+        out[tid] = [i for i in range(n) if mask >> i & 1]
+    return out
+
+
+def check(test_ids: list[str], base: dict, skip_exec_ok: bool, log=None, only: dict | None = None) -> dict[str, bool]:
     """{test id: True if provably the pinned verdict}. Runs inside a process whose cwd and
     sys.path[0] are the patched tree, with SKIP_INTEGRATION=0."""
     out: dict[str, bool] = {}
@@ -284,7 +434,9 @@ def check(test_ids: list[str], base: dict, skip_exec_ok: bool, log=None) -> dict
                 out[tid] = False
                 continue
             try:
-                out[tid] = run_one(tid, b, skip_exec_ok, log) is True
+                # (`only` is used by the audit of reach-limited replays alone, never for a verdict)
+                out[tid] = run_one(tid, b, skip_exec_ok, log,
+                                   only=None if only is None else set(only.get(tid, ()))) is True
             except BaseException as exc:  # noqa: BLE001 - any failure means "not the same"
                 if log:
                     log(f"replay: {tid.rsplit('::', 1)[-1]} raised {type(exc).__name__}")
@@ -437,6 +589,169 @@ def _trace_child(repo: str, out_path: str, variant: str, blobs_path: str) -> Non
         json.dump({f: sorted(ls) for f, ls in lines.items() if f.startswith("sqlglot/")}, fh)
 
 
+def _reach_child(repo: str, out_path: str) -> None:
+    """Which query's processing runs which sqlglot line, at the pinned commit.
+
+    The replayed tests are run through run_one() itself, with every line recorded into the
+    window of the query being processed (parse, pickle, transpile, optimize, execute), or into
+    "outside" (import of sqlglot and the tests, set-up, everything between windows). Two
+    arrangements: every query alone in a fork made before any query ran ("fresh": what is
+    built lazily or cached is built by each query that needs it), all queries in order in this
+    process ("seq"), and every query alone in a fork made after all of them ran ("warm").
+    Recording starts before sqlglot is imported."""
+    root = os.path.realpath(repo) + os.sep
+    mon = sys.monitoring
+    tool = 3
+    cache: dict[str, str | None] = {}
+    buckets: dict = {None: {}}
+    cur = [buckets[None]]
+    tid_now = [None]
+
+    def rel(p):
+        if p not in cache:
+            if not p or p.startswith("<"):
+                cache[p] = None
+            else:
+                r = os.path.realpath(p)
+                cache[p] = r[len(root):] if r.startswith(root) else None
+        return cache[p]
+
+    def on_line(code, line):
+        r = rel(code.co_filename)
+        if r is not None:
+            cur[0].setdefault(r, set()).add(line)
+        return mon.DISABLE
+
+    mon.use_tool_id(tool, "reach")
+    mon.register_callback(tool, mon.events.LINE, on_line)
+    mon.set_events(tool, mon.events.LINE)
+
+    def window(i):
+        cur[0] = buckets.setdefault(None if i is None else (tid_now[0], i), {})
+        mon.restart_events()
+
+    sys.path.insert(0, repo)
+    os.chdir(repo)
+    os.environ["SKIP_INTEGRATION"] = "0"
+    import tests.test_executor as te
+
+    te.TestExecutor.setUpClass()
+    _LOADED.update(("tpch", "tpcds"))
+    outside = buckets[None]
+    counts = {tid: len(list(te.load_sql_fixture_pairs(
+        "optimizer/tpc-ds/tpc-ds.sql" if tid == T_TPCDS else "optimizer/tpc-h/tpc-h.sql"))) for tid in REPLAYABLE}
+    fresh: dict = {}
+    warmed: dict = {}
+    for view in (fresh, None, warmed):
+      if view is None:
+        for tid in REPLAYABLE:
+            tid_now[0] = tid
+            if len(run_one(tid, None, window=window)) != counts[tid]:
+                raise RuntimeError("reach: query count")
+        window(None)
+        seq = {k: v for k, v in buckets.items() if k is not None}
+        continue
+      for tid in REPLAYABLE:
+        for i in range(counts[tid]):
+            r, w = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                code = 1
+                try:
+                    os.close(r)
+                    buckets.clear()
+                    buckets[None] = {}
+                    cur[0] = buckets[None]
+                    tid_now[0] = tid
+                    mon.restart_events()
+                    run_one(tid, None, only={i}, window=window)
+                    mon.set_events(tool, 0)
+                    doc = {"in": {f: sorted(ls) for f, ls in buckets.get((tid, i), {}).items()},
+                           "out": {f: sorted(ls) for f, ls in buckets[None].items()}}
+                    with os.fdopen(w, "w") as fh:
+                        json.dump(doc, fh)
+                    code = 0
+                finally:
+                    os._exit(code)
+            os.close(w)
+            with os.fdopen(r) as fh:
+                text = fh.read()
+            _, status = os.waitpid(pid, 0)
+            if status != 0 or not text:
+                raise RuntimeError(f"reach trace failed: {tid} query {i}")
+            doc = json.loads(text)
+            view[(tid, i)] = doc["in"]
+            for f, ls in doc["out"].items():
+                outside.setdefault(f, set()).update(ls)
+    mon.set_events(tool, 0)
+
+    def masks(view):
+        out: dict = {}
+        for (tid, i), files in view.items():
+            for f, ls in files.items():
+                if f.startswith("sqlglot/"):
+                    d = out.setdefault(tid, {}).setdefault(f, {})
+                    for ln in ls:
+                        d[ln] = d.get(ln, 0) | (1 << i)
+        return {t: {f: {str(ln): format(m, "x") for ln, m in d.items()} for f, d in fs.items()}
+                for t, fs in out.items()}
+
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump({"counts": counts,
+                   "outside": {f: sorted(ls) for f, ls in outside.items() if f.startswith("sqlglot/")},
+                   "masks": {"seq": masks(seq), "fresh": masks(fresh), "warm": masks(warmed)}}, fh)
+    os._exit(0)  # duckdb connections were inherited by forks: skip interpreter teardown
+
+
+def _merge_reach(runs: list[dict]) -> dict:
+    """One reach map from several recordings (arrangements x hash seeds): a line's queries are
+    the union, and a line whose queries differ between any two recordings is "unstable"."""
+    counts = runs[0]["counts"]
+    outside: dict[str, set[int]] = {}
+    for r in runs:
+        if r["counts"] != counts:
+            raise RuntimeError("reach: query counts differ between runs")
+        for f, ls in r["outside"].items():
+            outside.setdefault(f, set()).update(ls)
+    views = [r["masks"][k] for r in runs for k in ("seq", "fresh", "warm")]
+    lines: dict = {}
+    unstable: dict = {}
+    for tid in counts:
+        keys = set()
+        for v in views:
+            for f, d in v.get(tid, {}).items():
+                keys.update((f, ln) for ln in d)
+        by_file: dict = {}
+        bad: dict = {}
+        for f, ln in keys:
+            ints = [int(v.get(tid, {}).get(f, {}).get(ln, "0"), 16) for v in views]
+            union = 0
+            for x in ints:
+                union |= x
+            if any(x != ints[0] for x in ints):
+                bad.setdefault(f, []).append(int(ln))
+            by_file.setdefault(f, {}).setdefault(format(union, "x"), []).append(int(ln))
+        lines[tid] = {f: {m: _ranges(ls) for m, ls in sorted(d.items())} for f, d in sorted(by_file.items())}
+        unstable[tid] = {f: _ranges(ls) for f, ls in sorted(bad.items())}
+    return {"counts": counts, "outside": {f: _ranges(sorted(ls)) for f, ls in sorted(outside.items())},
+            "lines": lines, "unstable": unstable}
+
+
+def build_reach(repo: str, tmpdir: str) -> dict:
+    runs = []
+    for seed in ("1", "777"):
+        rp = os.path.join(tmpdir, f"reach-{seed}.json")
+        _run_self("_reach", repo, rp, seed=seed)
+        with open(rp, encoding="utf-8") as fh:
+            runs.append(json.load(fh))
+    doc = _merge_reach(runs)
+    n_lines = sum(len(r) for t in doc["lines"].values() for d in t.values() for r in d.values())
+    n_bad = sum(b - a + 1 for t in doc["unstable"].values() for rs in t.values() for a, b in rs)
+    print(f"replay reach: {n_lines} line ranges, {n_bad} unstable lines, "
+          f"{sum(b - a + 1 for rs in doc['outside'].values() for a, b in rs)} lines outside windows", file=sys.stderr)
+    return doc
+
+
 def _ranges(ls: list[int]) -> list[list[int]]:
     out: list[list[int]] = []
     for n in sorted(set(ls)):
@@ -505,6 +820,7 @@ def build(repo: str, out_path: str) -> None:
                     union.setdefault(f, set()).update(ls)
         doc["exec_lines"] = {f: _ranges(sorted(ls)) for f, ls in sorted(union.items())}
         print(f"replay exec lines: {sum(len(v) for v in union.values())} lines in {len(union)} files", file=sys.stderr)
+        doc["reach"] = build_reach(repo, tmpdir)
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, separators=(",", ":"))
     import shutil
@@ -519,5 +835,15 @@ if __name__ == "__main__":
         _blobs_child(sys.argv[2], sys.argv[3])
     elif sys.argv[1] == "_trace":
         _trace_child(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+    elif sys.argv[1] == "_reach":
+        _reach_child(sys.argv[2], sys.argv[3])
+    elif sys.argv[1] == "reach":  # add the reach map to an existing baseline file
+        import tempfile
+
+        with open(sys.argv[3], encoding="utf-8") as fh:
+            _doc = json.load(fh)
+        _doc["reach"] = build_reach(os.path.abspath(sys.argv[2]), tempfile.mkdtemp(prefix="reach-build-"))
+        with open(sys.argv[4], "w", encoding="utf-8") as fh:
+            json.dump(_doc, fh, separators=(",", ":"))
     elif sys.argv[1] == "build":
         build(os.path.abspath(sys.argv[2]), sys.argv[3])
