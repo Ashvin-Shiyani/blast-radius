@@ -10,6 +10,7 @@ import ast
 import json
 import os
 import re
+import symtable
 import zlib
 from dataclasses import dataclass, field
 
@@ -482,11 +483,24 @@ def _refine_import_time(path: str, ln: int, st: tuple[int, int], sc: FileScopes,
         if not users:
             # never seen instantiated (stdlib-built: Enum, NamedTuple, ...): cannot narrow by users
             return importers, "import/no-instances"
+        # v9 (F1): a class-creation hook of an enclosing class reads the nested class at import
+        # and keeps what it derives on the enclosing class (_Dialect.__new__: QUOTE_START,
+        # HEX_START, SUPPORTS_COLUMN_JOIN_MARKS ... from the nested Tokenizer), where code reads
+        # it through an instance of the enclosing class without ever instantiating the nested
+        # one. Every enclosing class's instantiators (subclasses come with the MRO records) use it.
+        for k in range(1, len(chain)):
+            users |= M.inst_tests(f"{_module_of(path)}:{'.'.join(c[2] for c in chain[:k])}") or set()
         outer = chain[0]
         refs = _users_of_name(outer[2], M, R, True, (path, outer[0], outer[1]))
         if refs is None:
             return importers, "import"
         users |= refs
+        # v9 (F1): ... and so does every class that keeps this one under an attribute or is handed
+        # it by a class-creation hook (see _holders)
+        held = _holders(outer[2], M, R, (path, outer[0], outer[1]))
+        if held is None:
+            return importers, "import"
+        users |= held
         refined = importers & users
         names = _assigned_names(sc.stmt_node_of(ln))
         if names:
@@ -503,6 +517,423 @@ def _refine_import_time(path: str, ln: int, st: tuple[int, int], sc: FileScopes,
     if users is None:
         return importers, "import"
     return importers & users, f"import/names {sorted(names)[:3]}"
+
+
+_REPO = None
+_SRC_LINES: dict[str, list[str]] = {}
+
+
+def _pinned_line(f: str, ln: int) -> str | None:
+    lines = _SRC_LINES.get(f)
+    if lines is None:
+        try:
+            with open(os.path.join(_REPO or os.environ.get("BR_REPO", "/app/sqlglot"), f), encoding="utf-8") as fh:
+                lines = fh.read().split("\n")
+        except OSError:
+            lines = []
+        _SRC_LINES[f] = lines
+    return lines[ln - 1] if 0 < ln <= len(lines) else None
+
+
+# defs the interpreter calls while it creates a class (the pinned tree has one metaclass,
+# _Dialect, with __new__ only, and two __init_subclass__)
+CLASS_HOOKS = ("__new__", "__init_subclass__", "__set_name__", "__prepare__", "__class_getitem__")
+
+
+def _in_class_hook(f: str, ln: int) -> bool:
+    """True if a def above line `ln` that may enclose it (read off the indentation) is a
+    class-creation hook; an unreadable file counts as yes."""
+    text = _pinned_line(f, ln)
+    if text is None:
+        return True
+    cur = len(text) - len(text.lstrip())
+    for j in range(ln - 1, 0, -1):
+        t = _SRC_LINES[f][j - 1].lstrip()
+        ind = len(_SRC_LINES[f][j - 1]) - len(t)
+        if ind < cur and t.startswith(("def ", "async def ")):
+            if t.split("(")[0].split()[-1] in CLASS_HOOKS:
+                return True
+            cur = ind
+            if cur == 0:
+                break
+    return False
+
+
+def _holders(name: str, M: "Map", R, skip: tuple[str, int, int]) -> set[int] | None:
+    """v9 (F1). Tests that can read attributes of the class `name` through another class that
+    keeps it, without instantiating it and without spelling its name:
+    - a class body that stores it under an attribute (`Parser = BigQueryParser`: the dialect
+      reads `parser_class.FUNCTIONS`, `generator_class.TYPE_MAPPING` ... through itself): the
+      users of that class;
+    - a class-creation hook that is handed it as an object (_Dialect.__new__ takes
+      tokens.Tokenizer, Parser, Generator, JSONPathTokenizer as every dialect's defaults and
+      derives QUOTE_START, HEX_START ... from them): everyone who runs that line.
+    None if a file cannot be read."""
+    out: set[int] = set()
+    sf, s0, s1 = skip
+    pat = re.compile(r"^\s*[A-Za-z_]\w*\s*(?::[^=]*)?=\s*(?:[\w.]+\.)?" + re.escape(name) + r"\s*(?:#.*)?$")
+    for f, ln, flags in R.entries(name):
+        if flags & 7 or (f == sf and s0 <= ln <= s1):
+            continue
+        text = _pinned_line(f, ln)
+        if text is None:
+            return None
+        if pat.match(text):
+            if R.class_at(f, ln) is not None:
+                out |= _import_time_users(f, ln, M, R) | M.rt_lines(f, ln, ln)
+        elif M.rt_lines(f, ln, ln) and _in_class_hook(f, ln):
+            out |= M.rt_lines(f, ln, ln)
+    return out
+
+
+def _is_nocode(st) -> bool:
+    """A statement that compiles to no instruction of its own, so that no coverage map can say
+    who ran it: global / nonlocal, a bare constant (docstring), an annotation without a value."""
+    return (isinstance(st, (ast.Global, ast.Nonlocal))
+            or (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))
+            or (isinstance(st, ast.AnnAssign) and st.value is None))
+
+
+def _own_yield(node) -> bool:
+    """Does the def (or lambda) yield in its own scope, i.e. is it a generator function?"""
+    todo = [node.body] if isinstance(node, ast.Lambda) else list(node.body)
+    while todo:
+        n = todo.pop()
+        if isinstance(n, (ast.Yield, ast.YieldFrom)):
+            return True
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        todo.extend(ast.iter_child_nodes(n))
+    return False
+
+
+def _nested_kinds(fn, line_of) -> dict:
+    out: dict = {}
+    for n in ast.walk(fn):
+        if n is not fn and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            base = (line_of(n.lineno), type(n).__name__, getattr(n, "name", ""))
+            k = 0
+            while base + (k,) in out:
+                k += 1
+            out[base + (k,)] = _own_yield(n)
+    return out
+
+
+def _shape(node, holes: set[int]) -> str:
+    """ast.dump of a def with the statements in `holes` taken out of their blocks."""
+    saved = []
+    for n in ast.walk(node):
+        for fld in ("body", "orelse", "finalbody"):
+            lst = getattr(n, fld, None)
+            if isinstance(lst, list) and lst and any(id(x) in holes for x in lst):
+                saved.append((n, fld, lst))
+                setattr(n, fld, [x for x in lst if id(x) not in holes])
+    try:
+        return ast.dump(node)
+    finally:
+        for n, fld, lst in saved:
+            setattr(n, fld, lst)
+
+
+def _seg_text(lines: list[str], first: int, last: int) -> str:
+    """Lines first..last of a file as a module of their own that keeps the file's line numbers
+    (an indented def is put under `if 1:`, which opens no scope)."""
+    seg = "\n".join(lines[first - 1:last]) + "\n"
+    if lines[first - 1][:1] in (" ", "\t"):
+        return "\n" * (first - 2) + "if 1:\n" + seg
+    return "\n" * (first - 1) + seg
+
+
+def _scope_tables(text: str, name: str, path: str) -> list:
+    """(line, type, name, {symbol: (local, parameter, declared global, nonlocal, free)}) for the
+    def `name` at the top of the segment and every scope nested in it, from the compiler's own
+    symbol tables."""
+    top = symtable.symtable(text, path, "exec")
+    out: list = []
+
+    def walk(tab):
+        syms = {y.get_name(): (y.is_local(), y.is_parameter(), y.is_declared_global(), y.is_nonlocal(), y.is_free())
+                for y in tab.get_symbols()}
+        out.append((tab.get_lineno(), str(tab.get_type()).rsplit(".", 1)[-1].lower(), tab.get_name(), syms))
+        for ch in tab.get_children():
+            walk(ch)
+
+    for ch in top.get_children():
+        if ch.get_name() == name:
+            walk(ch)
+            break
+    return out
+
+
+_PLAIN = (False, False, False, False, False)  # a name only read here and found in the module or the builtins
+# What does NOT need the whole def:
+# - a name this scope only reads (from the module, the builtins or an enclosing def) comes, goes
+#   or is found one level further out: the scope whose binding changed is judged on its own;
+# - a local name LOSES its last binding (the statement was deleted or became `pass`) and is read
+#   from further out afterwards. Whoever read it before had run one of its bindings (or got an
+#   UnboundLocalError / NameError in the pinned tree), and every binding that went is a judged
+#   statement, so its executors are already candidates.
+# Everything else does: a name that becomes local, a parameter, a global or nonlocal declaration.
+_LOCAL = (True, False, False, False, False)
+_FREE = (False, False, False, False, True)
+
+
+def _scopes_differ(told: list, tnew: list, line_of, in_old, in_new) -> str | None:
+    """Why a name of code that did not change may now mean another variable, or None."""
+    def keyed(tabs, f):
+        d: dict = {}
+        for ln, ty, nm, syms in tabs:
+            base = (f(ln), ty, nm)
+            k = 0
+            while base + (k,) in d:
+                k += 1
+            d[base + (k,)] = (ln, syms)
+        return d
+
+    do, dn = keyed(told, lambda x: x), keyed(tnew, line_of)
+    for key, (ln, so) in do.items():
+        if key not in dn:
+            if not in_old(ln):
+                return f"scope {key[2]} at {ln} has no counterpart"
+            continue
+        sn = dn[key][1]
+        for nm in set(so) | set(sn):
+            a, b = so.get(nm, _PLAIN), sn.get(nm, _PLAIN)
+            if a != b and not (b in (_PLAIN, _FREE) and a in (_PLAIN, _FREE, _LOCAL)):
+                return f"name {nm} is bound differently in {key[2]}"
+    for key, (ln, sn) in dn.items():
+        if key not in do and not in_new(ln):
+            return f"new scope {key[2]} at +{ln} has no counterpart"
+    return None
+
+
+_BLOCK_WORDS = ("if", "elif", "else", "for", "while", "try", "except", "finally", "with", "class", "def", "async", "match", "case")
+
+
+def _block_word(text: str) -> str:
+    """The keyword of a line that opens a block (`else:`, `if x:`, `try:` ...), else ''."""
+    t = text.strip()
+    m = re.match(r"[a-z]+", t)
+    if m and m.group(0) in _BLOCK_WORDS and t.split("#")[0].rstrip().endswith(":"):
+        return m.group(0)
+    return ""
+
+
+def _inner_stmt(stmts: list, line: int):
+    best = None
+    for s0, s1, node in stmts:
+        if s0 <= line <= s1 and (best is None or s1 - s0 < best[1] - best[0]):
+            best = (s0, s1, node)
+    return best[2] if best else None
+
+
+def _scope_rule(path: str, fc: FileChange, new_src: str, origin: list, sc: FileScopes, live: set[int],
+                inserted: set[int], M: Map, A: Analysis, users: set[int]) -> None:
+    """v9. What a changed line of a def does to the REST of the def.
+
+    The rules above judge a change by its own statement: who ran that statement can see it.
+    That holds only if the patched def is the old def with those statements exchanged and
+    nothing else: the same blocks around the same other statements, every name of the other
+    statements bound to the same variable, the def still (not) a generator. Here this is
+    proven for each outermost def the patch touches, and where the proof fails everyone who
+    runs the def is a candidate:
+      1. shape: the old and the patched def are the same syntax tree once the judged
+         statements (the innermost statement of each changed line, and its counterpart at the
+         same place on the other side) are taken out of their blocks; an `else:`, `try:`,
+         `if ...:` line or a changed indentation that regroups other statements fails this,
+         unless it stays inside one judged compound statement, whose executors are selected;
+      2. names: the compiler's symbol tables of both defs give every name of every surviving
+         scope the same binding (local / parameter / global / nonlocal / free); a name that is
+         only read may come or go;
+      3. kind: no def or lambda in it gains or loses its last `yield` (if the outermost def
+         does, callers that never iterate it see the change without running a line of it:
+         every user of the file);
+      4. no judged old statement is one without bytecode (global, nonlocal, docstring, bare
+         annotation): the map cannot know who "ran" it.
+    A statement inserted whole runs for whoever finished the statement before it in its block
+    (or entered the block): the executors of that whole statement are added."""
+    old_lines, new_lines = sc.source.split("\n"), new_src.split("\n")
+    new_of = {o: i + 1 for i, o in enumerate(origin) if o is not None}
+    removed = sorted(set(fc.removed))
+    removed_set = set(removed)
+    added = [i + 1 for i, o in enumerate(origin) if o is None and (_is_code_line(new_lines[i]) or i in live)]
+
+    def outer_def(line: int):
+        best = None
+        for f in sc.funcs:
+            if f[0] <= line <= f[1] and (best is None or f[1] - f[0] > best[1] - best[0]):
+                best = f
+        return best
+
+    units: dict = {}
+    for ln in removed:
+        f = outer_def(ln)
+        if f is not None:
+            units[f] = True
+    for n in added:
+        a = next((origin[j] for j in range(n - 2, -1, -1) if origin[j] is not None), None)
+        f = outer_def(a) if a is not None else None
+        if f is not None:
+            units[f] = True
+
+    # Class and module level are not proven statement by statement (the rules above judge such
+    # a line by the names its own statement defines). A line there that opens or closes a
+    # block, or that changes its indentation, regroups the statements around it: nothing is
+    # known about which names that touches, so every user of the file.
+    top: list[str] = []
+    for old_no, new_no, old_text, new_text in replacement_targets(fc):
+        if outer_def(old_no) is None and (_is_code_line(old_text) or _is_code_line(new_text)):
+            io, inw = len(old_text) - len(old_text.lstrip()), len(new_text) - len(new_text.lstrip())
+            if _block_word(old_text) != _block_word(new_text) or (io != inw and _is_code_line(old_text) and _is_code_line(new_text)):
+                top.append(f"{old_no}")
+    paired_old = {t[0] for t in replacement_targets(fc)}
+    paired_new = {t[1] for t in replacement_targets(fc)}
+    for ln in removed:
+        if ln not in paired_old and outer_def(ln) is None and _block_word(old_lines[ln - 1]):
+            top.append(f"-{ln}")
+    for n in added:
+        if n not in paired_new and _block_word(new_lines[n - 1]):
+            a = next((origin[j] for j in range(n - 2, -1, -1) if origin[j] is not None), None)
+            b = next((origin[j] for j in range(n, len(origin)) if origin[j] is not None), None)
+            if (a is None or outer_def(a) is None) and (b is None or outer_def(b) is None):
+                top.append(f"+{n}")
+    if top:
+        A.cands |= users
+        A.opaque = True
+        A.changes.append((path, "import", 0, 0))
+        A.notes.append(f"{path}:{','.join(top[:4])} a block opens, closes or moves at class or module level -> all {len(users)} users")
+
+    def wide(f, why: str, everyone: bool = False) -> None:
+        more = set(users) if everyone else (M.rt_lines(path, f[0], f[1]) | M.imp_lines(path, f[2], f[1]))
+        A.cands |= more
+        if everyone:
+            A.opaque = True
+            A.changes.append((path, "import", 0, 0))
+        else:
+            A.changes.append((path, "body", f[2], f[1]))
+        A.notes.append(f"{path}:{f[0]} def: {why} -> {'all ' if everyone else ''}{len(more)}")
+
+    for f in units:
+        s, e, b0 = f
+        fo = next((nd for s0, s1, nd in sc.stmt_nodes if s1 == e and isinstance(nd, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and min([d.lineno for d in nd.decorator_list] + [nd.lineno]) == s), None)
+        if fo is None or s in removed_set or s not in new_of or fo.lineno in removed_set:
+            wide(f, "its first line changed")
+            continue
+        ns = new_of[s]
+        nxt = next((new_of[o] for o in range(e + 1, len(old_lines) + 1) if o in new_of), None)
+        ne = nxt - 1 if nxt is not None else len(new_lines)
+        try:
+            new_text = _seg_text(new_lines, ns, ne)
+            tree = ast.parse(new_text)
+            body = tree.body[0].body if new_lines[ns - 1][:1] in (" ", "\t") else tree.body
+            fn = body[0]
+        except (SyntaxError, ValueError, IndexError, AttributeError):
+            wide(f, "the patched def does not stand alone", True)
+            continue
+        if type(fn) is not type(fo) or fn.name != fo.name or min([d.lineno for d in fn.decorator_list] + [fn.lineno]) != ns:
+            wide(f, "the patched def is another def", True)
+            continue
+        nb0, nend = fn.body[0].lineno, fn.end_lineno
+
+        def line_of(n: int):
+            return origin[n - 1] if 0 < n <= len(origin) else None
+
+        old_stmts = [(s0, s1, nd) for s0, s1, nd in sc.stmt_nodes if b0 <= s0 and s1 <= e]
+        new_stmts = [(nd.lineno, nd.end_lineno, nd) for nd in ast.walk(fn) if isinstance(nd, ast.stmt) and nd is not fn]
+        j_old: dict = {}
+        j_new: dict = {}
+        direct: set[int] = set()
+        for ln in removed:
+            if b0 <= ln <= e:
+                st = _inner_stmt(old_stmts, ln)
+                if st is not None:
+                    j_old[id(st)] = st
+                    direct.add(id(st))
+        for n in added:
+            if nb0 <= n <= nend:
+                st = _inner_stmt(new_stmts, n)
+                if st is not None:
+                    j_new[id(st)] = st
+        for st in list(j_old.values()):
+            n = new_of.get(st.lineno) if st.lineno not in removed_set else None
+            if n is not None:
+                for s0, s1, nd in new_stmts:
+                    if s0 == n and type(nd) is type(st) and nd.col_offset == st.col_offset:
+                        j_new[id(nd)] = nd
+                        break
+        whole_new: list = []
+        for st in list(j_new.values()):
+            o = line_of(st.lineno)
+            hit = None
+            if o is not None:
+                hit = next((nd for s0, s1, nd in old_stmts if s0 == o and type(nd) is type(st) and nd.col_offset == st.col_offset), None)
+            if hit is not None:
+                j_old[id(hit)] = hit
+            elif o is None and all((x - 1) in inserted or not _is_code_line(new_lines[x - 1]) for x in range(st.lineno, st.end_lineno + 1)):
+                # every code line of it is an insertion (no removed line stands for it)
+                whole_new.append(st)
+        if _shape(fo, set(j_old)) != _shape(fn, set(j_new)):
+            wide(f, "the statements around the change are grouped differently")
+            continue
+        if _own_yield(fo) != _own_yield(fn):
+            wide(f, "it gains or loses its last yield", True)
+            continue
+        why = None
+        if any(isinstance(st, (ast.Global, ast.Nonlocal)) for st in list(j_old.values()) + list(j_new.values())):
+            why = "a global/nonlocal declaration changed"
+        elif any(_is_nocode(st) for st in j_old.values()):
+            why = "a statement without bytecode was replaced"
+        else:
+            ko, kn = _nested_kinds(fo, lambda x: x), _nested_kinds(fn, line_of)
+            if any(k in kn and kn[k] != v for k, v in ko.items()):
+                why = "a nested def gains or loses its last yield"
+        if why is None:
+            in_old = lambda ln: any(st.lineno <= ln <= st.end_lineno for st in j_old.values())  # noqa: E731
+            in_new = lambda ln: any(st.lineno <= ln <= st.end_lineno for st in j_new.values())  # noqa: E731
+            try:
+                why = _scopes_differ(_scope_tables(_seg_text(old_lines, s, e), fo.name, path),
+                                     _scope_tables(new_text, fn.name, path), line_of, in_old, in_new)
+            except (SyntaxError, ValueError, RecursionError) as exc:
+                why = f"no symbol table ({type(exc).__name__})"
+        if why is not None:
+            wide(f, why)
+            continue
+        # proven local: every judged old statement is covered by its executors (the rules above
+        # did this for the statement of a removed line; a counterpart found through an added
+        # line, e.g. the `if` that got an `else:`, is covered here)
+        for st in j_old.values():
+            more = M.rt_lines(path, st.lineno, st.end_lineno) | M.imp_lines(path, st.lineno, st.end_lineno)
+            if id(st) not in direct or not more <= A.cands:
+                A.notes.append(f"{path}:{st.lineno} {type(st).__name__} as a whole -> {len(more)}")
+                A.changes.append((path, "body", st.lineno, st.end_lineno))
+            A.cands |= more
+        if whole_new:
+            where: dict = {}
+            for nd in ast.walk(fn):
+                for fld in ("body", "orelse", "finalbody"):
+                    lst = getattr(nd, fld, None)
+                    if isinstance(lst, list):
+                        for i, x in enumerate(lst):
+                            where[id(x)] = (lst, i)
+            for st in whole_new:
+                lst, i = where[id(st)]
+                anchor = None
+                for x in list(reversed(lst[:i])) + lst[i + 1:]:
+                    o = line_of(x.lineno)
+                    if o is None or _is_nocode(x):
+                        continue
+                    anchor = next((nd for s0, s1, nd in old_stmts if s0 == o and type(nd) is type(x) and nd.col_offset == x.col_offset), None)
+                    if anchor is not None:
+                        break
+                if anchor is None:
+                    wide(f, f"a statement inserted at +{st.lineno} with no unchanged statement beside it")
+                    break
+                more = M.rt_lines(path, anchor.lineno, anchor.end_lineno) | M.imp_lines(path, anchor.lineno, anchor.end_lineno)
+                if not more <= A.cands:
+                    A.notes.append(f"{path}:+{st.lineno} inserted beside the {type(anchor).__name__} at {anchor.lineno} -> {len(more)}")
+                    A.changes.append((path, "body", anchor.lineno, anchor.end_lineno))
+                A.cands |= more
 
 
 def _strip_docstrings(tree: ast.AST) -> ast.AST:
@@ -909,6 +1340,14 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
                 A.cands |= hit
                 A.notes.append(f"{path}:+{nln} import-time insert -> {len(hit)}")
                 A.changes.append((path, "import", 0, 0))
+    # 3. v9: what a changed line does to the rest of its def (see _scope_rule)
+    try:
+        _scope_rule(path, fc, new_src, origin, sc, live, set(inserted), M, A, users)
+    except Exception as exc:  # noqa: BLE001  (a line-local judgement that could not be proven is not trusted)
+        A.cands |= users
+        A.opaque = True
+        A.changes.append((path, "import", 0, 0))
+        A.notes.append(f"{path}: no proof that the change stays in its statement ({type(exc).__name__}: {exc}) -> all {len(users)} users")
     if len(A.changes) == n_changes0:
         if _same_but_bare_strings(old_src, new_src):
             # v8: proven on the syntax trees: only docstrings / bare string statements differ
@@ -985,6 +1424,8 @@ def analyze_data(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
 
 
 def analyze_patch(text: str, repo: str, M: Map) -> Analysis:
+    global _REPO
+    _REPO = repo
     A = Analysis()
     try:
         files = parse_patch(text)
