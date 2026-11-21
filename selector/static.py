@@ -105,6 +105,10 @@ class Analysis:
     # range whose executors were selected; any other kind (import, signature, data, ...) may
     # act anywhere its module is loaded
     changes: list[tuple[str, str, int, int]] = field(default_factory=list)
+    # True when candidates were added by anything other than a judged line of an existing
+    # python file (new/deleted/renamed/non-compiling modules, data files)
+    opaque: bool = False
+    data_cands: set[int] = field(default_factory=set)  # readers of changed data files
 
 
 def _changed_span(old: str, new: str) -> tuple[int, int]:
@@ -430,11 +434,13 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
                 for f, ln in R.lines(n):
                     hit |= M.rt_lines(f, ln, ln) | M.imp_lines(f, ln, ln)
         A.cands |= hit
+        A.opaque = True
         A.notes.append(f"{fc.path}: new python file: {len(hit)} tests that list packages/directories")
         return
     users = M.file_users(path)
     if fc.is_deleted or fc.is_rename or (fc.new_path and fc.old_path and fc.new_path != fc.old_path):
         A.cands |= users
+        A.opaque = True
         A.notes.append(f"{fc.path}: deleted/renamed module -> all {len(users)} users")
         return
     old_src = open(old_file, encoding="utf-8").read()
@@ -454,6 +460,7 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
         except (SyntaxError, ValueError, LookupError, UnicodeDecodeError):
             A.cands |= users
             A.import_break |= users
+            A.opaque = True
             A.notes.append(f"{fc.path}: file no longer decodes/compiles -> {len(users)} users")
             return
     if old_tok is not None and old_tok == new_tok:
@@ -467,6 +474,7 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     except (SyntaxError, ValueError):
         A.cands |= users
         A.import_break |= users
+        A.opaque = True
         A.notes.append(f"{fc.path}: patched file does not compile -> {len(users)} users")
         return
     if len(fc.removed) + len(fc.added_text) > 200:
@@ -602,6 +610,8 @@ def analyze_data(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
             # a new data file is only read by code that lists its directory
             hit |= M.dir_openers(os.path.dirname(p))
     A.cands |= hit
+    A.data_cands |= hit
+    A.opaque = True
     A.notes.append(f"{fc.path}: data file opened by {len(hit)}")
 
 

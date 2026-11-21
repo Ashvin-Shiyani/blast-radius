@@ -12,8 +12,10 @@ RUN python /app/build/fetch_sqlglot.py /app/sqlglot \
 COPY selector/ /app/selector/
 COPY map/ /app/map/
 # identifier reference index of the pinned checkout (build CPU is not charged)
-RUN python /app/selector/refindex.py /app/sqlglot /app/map/refs.json \
- && python -m compileall -q /app/selector && chmod -R a+rX /app
+RUN python /app/selector/refindex.py /app/sqlglot /app/map/refs.json
+# replay baselines of the executor's TPC tests at the pinned commit (runs the tests: allowed at build)
+RUN SKIP_INTEGRATION=0 python /app/selector/replay.py build /app/sqlglot /app/map/replay.json
+RUN python -m compileall -q /app/selector && chmod -R a+rX /app
 ENV BR_DATA=/data BR_REPO=/app/sqlglot BR_MAP=/app/map/blast.map BR_REFS=/app/map/refs.json \
     BR_WORK=/tmp/br PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector/main.py"]

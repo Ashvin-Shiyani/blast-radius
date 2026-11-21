@@ -53,16 +53,39 @@ def warm_up() -> None:
     _WARM = True
 
 
+GC_EVERY = 40  # tests between explicit collections (automatic collection is off in children)
+
+
+def relax_gc() -> None:
+    """Children inherit a large heap that is never garbage (maps, pytest, pandas) and build
+    another when they import sqlglot. Automatic collection walks both again and again, which
+    is a tenth or more of a run's CPU. So: the inherited heap is frozen, automatic collection
+    is switched off, and the runner collects explicitly between tests. Tests that call
+    gc.collect() themselves behave as always."""
+    import gc
+
+    gc.freeze()
+    gc.disable()
+
+
 class _Collector:
     def __init__(self) -> None:
         self.failed: set[str] = set()
         self.seen: set[str] = set()
         self.errors: set[str] = set()
+        self._done = 0
 
     def pytest_runtest_logreport(self, report):
         self.seen.add(report.nodeid)
         if report.failed:
             self.failed.add(report.nodeid)
+
+    def pytest_runtest_logfinish(self, nodeid, location):
+        self._done += 1
+        if self._done % GC_EVERY == 0:
+            import gc
+
+            gc.collect()
 
     def pytest_collectreport(self, report):
         if report.failed:
@@ -70,7 +93,7 @@ class _Collector:
 
 
 def _child(overlay: str, test_ids: list[str], out: str, per_test_timeout: float, probe_report: str | None = None,
-           abort_on_infection: bool = False) -> None:
+           abort_on_infection: bool = False, import_mods: list[str] | None = None) -> None:
     import concurrent.futures as cf
     import multiprocessing as mp
     import unittest.case as uc
@@ -99,6 +122,7 @@ def _child(overlay: str, test_ids: list[str], out: str, per_test_timeout: float,
             return getattr(pprint, name)
 
     uc.pprint = _NoPformat()
+    relax_gc()
     orig_init = cf.ProcessPoolExecutor.__init__
 
     def capped(self, max_workers=None, mp_context=None, *a, **k):
@@ -121,15 +145,30 @@ def _child(overlay: str, test_ids: list[str], out: str, per_test_timeout: float,
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
+    imports = None
     try:
         pytest.main(args, plugins=[col])
+        if import_mods:
+            # the import check (see check_imports), done here to save a fork and a second
+            # import of sqlglot: after the tests, so it cannot change what they did
+            import importlib
+
+            imports = {}
+            for m in import_mods:
+                try:
+                    importlib.import_module(m)
+                    imports[m] = True
+                except BaseException:  # noqa: BLE001
+                    imports[m] = False
     finally:
         with open(out, "w") as fh:
-            json.dump({"failed": sorted(col.failed), "seen": sorted(col.seen), "errors": sorted(col.errors)}, fh)
+            json.dump({"failed": sorted(col.failed), "seen": sorted(col.seen), "errors": sorted(col.errors),
+                       "imports": imports}, fh)
 
 
 def run(overlay: str, test_ids: list[str], workdir: str, timeout_s: float, per_test_timeout: float,
-        probe_report: str | None = None, abort_on_infection: bool = False) -> dict:
+        probe_report: str | None = None, abort_on_infection: bool = False,
+        import_mods: list[str] | None = None) -> dict:
     """Run test_ids against `overlay` in a forked child. Returns failed/seen/errors sets,
     timed_out flag and wall seconds."""
     warm_up()
@@ -145,7 +184,7 @@ def run(overlay: str, test_ids: list[str], workdir: str, timeout_s: float, per_t
             pass
         code = 0
         try:
-            _child(overlay, test_ids, out, per_test_timeout, probe_report, abort_on_infection)
+            _child(overlay, test_ids, out, per_test_timeout, probe_report, abort_on_infection, import_mods)
         except BaseException:  # noqa: BLE001
             code = 1
         os._exit(code)
@@ -164,12 +203,14 @@ def run(overlay: str, test_ids: list[str], workdir: str, timeout_s: float, per_t
         _kill(pid)
         raise
     res = {"failed": set(), "seen": set(), "errors": set(), "timed_out": timed_out,
-           "seconds": time.monotonic() - t0}
+           "seconds": time.monotonic() - t0, "imports": None}
     if os.path.exists(out):
         with open(out) as fh:
             d = json.load(fh)
         os.remove(out)
         res["failed"], res["seen"], res["errors"] = set(d["failed"]), set(d["seen"]), set(d["errors"])
+        if not timed_out and isinstance(d.get("imports"), dict):
+            res["imports"] = d["imports"]
     else:
         res["timed_out"] = True
     return res
@@ -229,3 +270,71 @@ def check_imports(overlay: str, modules: list[str], workdir: str, timeout_s: flo
         return d
     except (OSError, ValueError):
         return None
+
+
+def replay_check(overlay: str, test_ids: list[str], base: dict, skip_exec_ok: bool, workdir: str,
+                 timeout_s: float) -> tuple[dict[str, bool], list[str]]:
+    """Run replay.check on the patched overlay in a forked child. Returns ({test id: same?},
+    log lines); every test is False when the child timed out or died."""
+    warm_up()
+    out = os.path.join(workdir, f"rep-{os.getpid()}-{time.monotonic_ns()}.json")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setpgid(0, 0)
+        except OSError:
+            pass
+        code = 0
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            os.chdir(overlay)
+            sys.path.insert(0, overlay)
+            os.environ["SKIP_INTEGRATION"] = "0"
+            os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+            sys.dont_write_bytecode = True
+            relax_gc()  # a replay is short-lived: nothing is collected until it exits
+            import replay
+
+            notes: list[str] = []
+            res = replay.check(test_ids, base, skip_exec_ok, notes.append)
+            with open(out, "w") as fh:
+                json.dump({"res": res, "notes": notes}, fh)
+        except BaseException:  # noqa: BLE001
+            code = 1
+        os._exit(code)
+    t0 = time.monotonic()
+    timed_out = False
+    try:
+        while True:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            if time.monotonic() - t0 > timeout_s:
+                timed_out = True
+                _kill(pid)
+                break
+            time.sleep(0.005)
+    except BaseException:
+        _kill(pid)
+        raise
+    res = {t: False for t in test_ids}
+    notes = ["replay: timed out"] if timed_out else []
+    if not timed_out:
+        try:
+            with open(out) as fh:
+                d = json.load(fh)
+            for t, ok in d["res"].items():
+                if t in res:
+                    res[t] = ok is True
+            notes = list(d.get("notes", []))
+        except (OSError, ValueError):
+            notes = ["replay: no result"]
+    try:
+        os.remove(out)
+    except OSError:
+        pass
+    return res, notes

@@ -31,13 +31,27 @@ MAP = os.environ.get("BR_MAP", os.path.join(os.path.dirname(HERE), "map", "blast
 WORK = os.environ.get("BR_WORK", "/tmp/br")
 DYNAMIC = os.environ.get("BR_DYNAMIC", "1") == "1"
 
-CHEAP_S = 1.0  # tests at most this long (recorded) may be verified by running them
-HUGE_S = 3.0  # a clean probe drops only costly tests longer than this; shorter ones stay
-MAX_VERIFY_S = 6.0  # never verify a commit whose cheap candidates add up to more than this
-MAX_VERIFY_PROBE_S = 14.0  # ... unless a probe could drop costly candidates (cost model decides)
-OVERHEAD_S = 0.45  # fork + sqlglot import + collection, per verified commit (scorer CPU)
-CPU_FACTOR = 1.25  # our CPU seconds per recorded test second, with margin
+HUGE_S = 3.0  # a clean probe drops only unverified tests longer than this; shorter ones stay
+OVERHEAD_S = 0.35  # fork + sqlglot import + collection, per verification run (cost map machine)
+CPU_FACTOR = 1.25  # our CPU seconds per recorded test second, for tests the cost map lacks
+MIN_CONSIDER_S = 0.1  # tests cheaper than this are never weighed one by one
+MARGIN_S = 0.1  # expected gains smaller than this are not worth the bet
 WALL_PER_COMMIT_S = 4.5  # the limit is 3 min / ~40 commits (4.5 in the final, 1.5x commits)
+# replay.py: expected CPU seconds on the cost map's machine, (trees only, with the python
+# executor). A full TPC-DS replay takes about 8.3 s when nothing differs and stops within a
+# second or two when something does (about three times in ten): 0.7 * 8.3 + 0.3 * 1.5.
+REPLAY_OVERHEAD_S = 0.35
+REPLAY_COST = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": (1.4, 6.3),
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": (0.1, 0.1),
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch": (0.15, 0.15),
+}
+REPLAY_FULL_S = 8.3  # the same replay when it runs to its end (for time limits)
+REPLAY_CHEAP_S = 2.5  # replays at most this long also run when a probe says "invisible"
+
+MAP_DIR = os.path.dirname(MAP)
+COST = os.environ.get("BR_COST", os.path.join(MAP_DIR, "cost.json"))
+REPLAY = os.environ.get("BR_REPLAY", os.path.join(MAP_DIR, "replay.json"))
 
 
 def log(msg: str) -> None:
@@ -68,9 +82,6 @@ def patched_files(A, repo: str) -> dict[str, bytes | None]:
     return out
 
 
-KEEP_COSTLY_P = 0.6  # chance a probed change turns out visible (so costly candidates stay)
-
-
 def probe_target(A, repo: str):
     """The single one-line expression change a probe can watch, or None.
 
@@ -95,28 +106,28 @@ def probe_target(A, repo: str):
     return fc.old_path, lo, ln, span_o, span_n
 
 
-def import_breaks(A, M, cid) -> set[int]:
-    """Tests that fail because a patched module no longer imports (e.g. a class-body
-    expression that now raises). Narrowing by class users assumes the import still works;
-    this checks it. If the check cannot run, every user of the changed modules is kept."""
-    from static import import_check_modules
-
-    mods = import_check_modules(A, REPO)
-    if not mods:
-        return set()
+def import_check(A, mods: list[str], cid) -> dict[str, bool] | None:
+    """Import each module from the patched tree in a child of its own; None if it cannot run."""
     import warm
     from runner import build_overlay
 
     overlay = os.path.join(WORK, "ovi")
     try:
         build_overlay(REPO, overlay, patched_files(A, REPO))
-        res = warm.check_imports(overlay, mods, WORK, 60)
+        return warm.check_imports(overlay, mods, WORK, 60)
     except Exception as exc:  # noqa: BLE001
         log(f"{cid}: import check failed to run ({exc!r})")
-        res = None
+        return None
     finally:
         shutil.rmtree(overlay, ignore_errors=True)
-    failed = [m for m in mods] if res is None else [m for m, ok in res.items() if not ok]
+
+
+def import_breaks(M, mods: list[str], res: dict[str, bool] | None, cid) -> set[int]:
+    """Tests that fail because a patched module no longer imports (e.g. a class-body
+    expression that now raises). Narrowing by class users assumes the import still works;
+    `res` is the check of that ({module: imported}). If the check could not run (None), or
+    did not cover a module, every user of that module is kept."""
+    failed = [m for m in mods if res is None or res.get(m) is not True]
     out: set[int] = set()
     for m in failed:
         rel = m.replace(".", "/")
@@ -147,31 +158,268 @@ def make_probe(A, cid):
         return None
 
 
-def choose_verify(A, cands: set[int], dsec: dict[int, float], dms: dict[int, int],
-                  probeable: bool = False) -> tuple[list[int], list[int], str]:
-    """Return (to_run, keep_static, reason). to_run empty means: no dynamic verification."""
+class Costs:
+    """What a test costs us to run (costmap.py), with recorded seconds as the fallback."""
+
+    def __init__(self, path: str, tests: list[dict]):
+        self.sec: dict[int, float] = {}
+        self.setup: dict[str, float] = {}
+        self.scale = 1.0
+        self.cls = {t["number"]: t["id"].rsplit("::", 1)[0] for t in tests}
+        self.rec = {t["number"]: float(t["seconds"]) for t in tests}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                d = json.load(fh)
+            self.scale = float(d.get("scale", 1.0))
+            num = {t["id"]: t["number"] for t in tests}
+            self.sec = {num[i]: float(v) for i, v in d["tests"].items() if i in num}
+            self.setup = {c: float(v) for c, v in d.get("class_setup", {}).items()}
+        except Exception as exc:  # noqa: BLE001
+            log(f"cost map unavailable ({exc!r}): using recorded seconds")
+
+    def run(self, n: int) -> float:
+        c = self.sec.get(n)
+        return CPU_FACTOR * self.rec[n] if c is None else self.scale * c
+
+    def class_setup(self, n: int) -> float:
+        return self.scale * self.setup.get(self.cls[n], 0.0)
+
+
+def replay_valid(A, M, n: int) -> bool:
+    """replay.py mirrors test n faithfully only while its test code and fixtures are the
+    pinned ones: every changed file must be an existing sqlglot/ module, or a fixture the
+    test never opens."""
+    for fc in A.files:
+        if fc.is_binary or fc.is_new or fc.is_deleted or fc.is_rename:
+            return False
+        if fc.new_path and fc.old_path and fc.new_path != fc.old_path:
+            return False
+        path = fc.old_path or fc.path
+        if path.endswith(".py"):
+            if not path.startswith("sqlglot/") or not os.path.isfile(os.path.join(REPO, path)):
+                return False
+        else:
+            if not path.startswith("tests/fixtures/") or not os.path.isfile(os.path.join(REPO, path)):
+                return False
+            if any(n in M.openers(q) for q in fc.paths):
+                return False
+    return True
+
+
+def gain_for(n: int) -> float:
+    """Share of the possible saving that verifying n candidates realizes on average: the
+    fewer tests reach a change, the likelier they are the ones that fail (measured on our
+    own labelled mutants: 0.3-0.5 for a handful of candidates, about 0.65 beyond ten)."""
+    return 0.35 if n <= 1 else 0.45 if n <= 10 else 0.65
+
+
+GAIN_REPLAY = 0.7  # a replayed TPC test is unchanged about seven times in ten
+GAIN_VISIBLE = 0.35  # ... and once a probe has seen the change take effect, failures are likely
+GAIN_PROBED = 0.9  # a probed run only runs to its end while the change stays invisible
+MIN_PROBE_TESTS = 20  # a clean probe speaks for unverified tests only after this many ran
+BIG_TRIES = 12
+
+
+PROBE_RUN_SHARE = 0.5  # a probed run may cost up to this share of what selecting everything costs
+
+
+def plan(verifiable: set[int], fixed_keep: set[int], vcost: dict[int, float], costs: Costs,
+         replays: set[int], dms: dict[int, int], gain: float | None = None,
+         probed: bool = False) -> tuple[set[int], set[int], float, str]:
+    """Split `verifiable` into tests to verify now and tests to simply select.
+
+    Verifying a test costs vcost CPU seconds and removes it from the selection if it passes.
+    Two plans are costed, and the cheaper is returned if it beats selecting everything:
+    verify all but what is not worth it (dearest first), or verify only the few tests that
+    dominate the selection. Returns (verify, keep, estimated CPU seconds, reason); keep
+    includes fixed_keep.
+    """
+    everything = sorted(verifiable | fixed_keep)
+    static_ms = pack(everything, dms)[0]
+    if gain is None:
+        gain = GAIN_PROBED if probed else gain_for(len(verifiable - replays))
+
+    def g(n: int) -> float:
+        return GAIN_REPLAY if n in replays else gain
+
+    def finish(verify: set[int], keep: set[int]):
+        """Estimated total cost of a plan, after charging class set-up."""
+        keep = set(keep)
+        keep_ms = pack(sorted(keep), dms)[0]
+        groups: dict[str, set[int]] = {}
+        for n in verify:
+            if n not in replays and costs.class_setup(n) >= 0.2:
+                groups.setdefault(costs.cls[n], set()).add(n)
+        setup_s = 0.0
+        for cls_name in sorted(groups):
+            grp = groups[cls_name]
+            setup = costs.class_setup(next(iter(grp)))
+            extra = pack(sorted(keep | grp), dms)[0] - keep_ms
+            if (setup + sum(vcost[n] for n in grp)) * 1000 >= gain * extra:
+                keep |= grp  # set-up makes this class not worth running
+                keep_ms += extra
+            else:
+                setup_s += setup
+        verify = set(verify) - keep
+        if not verify:
+            return None
+        cpu = setup_s + sum(vcost[n] for n in verify)
+        if verify - replays:
+            cpu += OVERHEAD_S * costs.scale
+        if verify & replays:
+            cpu += REPLAY_OVERHEAD_S * costs.scale
+        weight = sum(dms[n] for n in verify) or 1
+        blend = sum(g(n) * dms[n] for n in verify) / weight
+        est = cpu + (keep_ms + (1.0 - blend) * (static_ms - keep_ms)) / 1000
+        return est, cpu, verify, keep
+
+    # plan A: verify everything except tests that cost more to verify than they add
+    keep = set(fixed_keep)
+    keep_ms = pack(sorted(keep), dms)[0]
+    verify = set(verifiable) - keep
+    for n in sorted(verify, key=lambda n: (-vcost[n], n)):
+        if vcost[n] < MIN_CONSIDER_S:
+            break
+        extra = pack(sorted(keep | {n}), dms)[0] - keep_ms
+        if vcost[n] * 1000 >= g(n) * extra:
+            keep.add(n)
+            keep_ms += extra
+    plan_a = finish(verify - keep, keep)
+    plans = [plan_a]
+    # plan B: select everything except the few long tests whose removal pays for itself
+    keep = set(everything)
+    keep_ms = static_ms
+    for n in sorted(set(verifiable) - fixed_keep, key=lambda n: (-dms[n], n))[:BIG_TRIES]:
+        less = keep_ms - pack(sorted(keep - {n}), dms)[0]
+        if vcost[n] * 1000 < g(n) * less:
+            keep.discard(n)
+            keep_ms -= less
+    if len(keep) < len(everything):
+        plans.append(finish(set(everything) - keep, keep))
+    plans = [p for p in plans if p is not None]
+    if not plans:
+        return set(), set(everything), 0.0, "nothing worth verifying"
+    est, cpu, verify, keep = min(plans, key=lambda p: p[0])
+    if probed and plan_a is not None and plan_a[2] - replays:
+        # a probe watches the run: it stops at the first visible difference, and a clean one
+        # settles the whole commit, so running the cheap candidates is worth more than the
+        # estimate above credits. Take that plan whenever the run itself is affordable.
+        run_cpu = plan_a[1] - sum(vcost[n] for n in plan_a[2] & replays)
+        if run_cpu * 1000 <= PROBE_RUN_SHARE * static_ms:
+            _, cpu, verify, keep = plan_a
+            return verify, keep, cpu, (f"probe run {len(verify)} (~{cpu:.1f}s cpu) vs static "
+                                       f"{static_ms / 1000:.1f}s")
+    if est + MARGIN_S >= static_ms / 1000:
+        return set(), set(everything), 0.0, f"verification ({est:.1f}s) not cheaper than static ({static_ms / 1000:.1f}s)"
+    return verify, keep, cpu, (f"verify {len(verify)} (~{cpu:.1f}s cpu): est {est:.1f}s vs static "
+                               f"{static_ms / 1000:.1f}s")
+
+
+def run_replay(A, nums: list[int], id_of, cid: str, base: dict, skip_exec_ok: bool, est_s: float) -> set[int]:
+    """Replay the given tests on the patched tree; returns those NOT proven unchanged."""
+    import warm
+    from runner import build_overlay
+
+    if not nums:
+        return set()
+    overlay = os.path.join(WORK, "ovr")
+    try:
+        build_overlay(REPO, overlay, patched_files(A, REPO))
+        import resource
+
+        r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        res, notes = warm.replay_check(overlay, [id_of[n] for n in nums], base, skip_exec_ok, WORK,
+                                       20 + 4 * max(est_s, REPLAY_FULL_S))
+        r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        same = [n for n in nums if res.get(id_of[n]) is True]
+        log(f"{cid}: replay cpu {r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime:.2f}s "
+            f"({'trees' if skip_exec_ok else 'full'}): {len(same)}/{len(nums)} unchanged"
+            + (f" | {'; '.join(notes)[:120]}" if notes else ""))
+        return set(nums) - set(same)
+    except Exception as exc:  # noqa: BLE001
+        log(f"{cid}: replay failed to run ({exc!r}): keeping")
+        return set(nums)
+    finally:
+        shutil.rmtree(overlay, ignore_errors=True)
+
+
+def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) -> tuple[set[int], str]:
+    """The tests to select for a commit whose static candidates are `cands`."""
+    dsec, dms, id_of, costs, M = ctx["dsec"], ctx["dms"], ctx["id_of"], ctx["costs"], ctx["M"]
     if not cands:
-        return [], [], "no candidates"
+        return set(), "no candidates"
     py_effect = any(fc.path.endswith(".py") and not any(n.startswith(f"{fc.path}: comments") for n in A.notes)
                     for fc in A.files)
-    only_data = not py_effect
-    cheap = sorted(n for n in cands if dsec[n] <= CHEAP_S)
-    costly = sorted(n for n in cands if dsec[n] > CHEAP_S)
-    if only_data:
-        return [], sorted(cands), "data-only change: its readers nearly always fail"
-    if not cheap:
-        return [], sorted(cands), "nothing cheap to verify"
-    cheap_s = sum(dsec[n] for n in cheap)
-    if cheap_s > (MAX_VERIFY_PROBE_S if (probeable and costly) else MAX_VERIFY_S):
-        return [], sorted(cands), f"cheap candidates too long to verify ({cheap_s:.1f}s)"
-    static_cost = pack(sorted(cands), dms)[0] / 1000
-    floor = pack(costly, dms)[0] / 1000 if costly else 0.0
-    if probeable and costly:
-        floor *= KEEP_COSTLY_P
-    verify_cost = OVERHEAD_S + CPU_FACTOR * cheap_s + floor
-    if verify_cost >= static_cost:
-        return [], sorted(cands), f"verification ({verify_cost:.1f}s) not cheaper than static ({static_cost:.1f}s)"
-    return cheap, costly, f"verify {len(cheap)} ({cheap_s:.2f}s): est {verify_cost:.1f}s vs static {static_cost:.1f}s"
+    if not py_effect:
+        return set(cands), "data-only change: its readers nearly always fail"
+    base = ctx["replay"]
+    skip_exec_ok = False
+    replays: set[int] = set()
+    vcost: dict[int, float] = {}
+    if base is not None:
+        import replay
+
+        skip_exec_ok = not A.opaque and not replay.exec_lines_touched(base, A.changes)
+        for n in cands:
+            rc = REPLAY_COST.get(id_of[n])
+            if rc is not None and id_of[n] in base.get("tests", {}) and replay_valid(A, M, n):
+                replays.add(n)
+                vcost[n] = costs.scale * (rc[0] if skip_exec_ok else rc[1])
+    for n in cands:
+        if n not in vcost:
+            vcost[n] = costs.run(n)
+    static_ms = pack(sorted(cands), dms)[0]
+    # readers of a changed fixture nearly always fail: selected without being run
+    fixed = set(cands) & A.data_cands
+    verify_set, keep, cpu, why = plan(set(cands) - fixed, fixed, vcost, costs, replays, dms,
+                                      probed=probed is not None)
+    if not verify_set:
+        return set(cands), why
+    worst = cpu + (REPLAY_FULL_S * costs.scale if replays & verify_set else 0.0)
+    if 1.5 * worst + 1.0 > time_left:
+        return set(cands), "out of time budget: static"
+    rep = sorted(verify_set & replays)
+    run = sorted(verify_set - replays)
+    rep_est = sum(vcost[n] for n in rep)
+
+    def do_run(ids: list[int], probe, abort: bool):
+        return verify(A, ids, id_of, ctx["num_of"], ctx["file_tests"], dsec, cid, probe, abort, ctx["imports"])
+
+    if probed is not None and run:
+        # a probe watches the changed expression: the run stops at the first difference
+        failing, clean, aborted = do_run(run, probed, True)
+        if clean and not failing:
+            # the changed expression ran and never differed. Cheap replays still run (they
+            # are exact). Other unverified huge tests are dropped only on broad evidence;
+            # with few tests behind the probe, a replayable one is replayed in full instead.
+            broad = len(run) >= MIN_PROBE_TESTS
+            now = [n for n in rep if vcost[n] <= REPLAY_CHEAP_S * costs.scale or not broad]
+            differ = run_replay(A, now, id_of, cid, base, skip_exec_ok, sum(vcost[n] for n in now))
+            rest = (keep | set(rep)) - set(now)
+            # (never a reader of a changed fixture: the probe says nothing about data)
+            huge = {n for n in rest - fixed if dsec[n] > HUGE_S} if broad else set()
+            return (rest - huge) | differ, why + f" | probe: never visible -> {len(huge)} huge dropped"
+        if aborted:
+            # nothing is known about the tests yet, except that failures are now likely
+            differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est)
+            verify2, keep2, _, why2 = plan(set(run), keep | differ, vcost, costs, set(), dms, GAIN_VISIBLE)
+            if not verify2:
+                return keep2, why + " | visible: " + why2
+            failing, _, _ = do_run(sorted(verify2), None, False)
+            return keep2 | failing, why + " | visible: " + why2
+        differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est)
+        return keep | failing | differ, why
+    differ = run_replay(A, rep, id_of, cid, base, skip_exec_ok, rep_est)
+    if not run:
+        return keep | differ, why
+    if differ:
+        verify2, keep2, _, why2 = plan(set(run), keep | differ, vcost, costs, set(), dms)
+        if not verify2:
+            return keep2, why + " | after replay: " + why2
+        failing, _, _ = do_run(sorted(verify2), probed, False)
+        return keep2 | failing, why + " | after replay: " + why2
+    failing, _, _ = do_run(run, probed, False)
+    return keep | failing, why
 
 
 def main() -> int:
@@ -190,12 +438,19 @@ def main() -> int:
     commits = sorted(f[: -len(".patch")] for f in os.listdir(cdir) if f.endswith(".patch"))
     wall_budget = WALL_PER_COMMIT_S * len(commits) * 0.55
     try:
-        from static import Map, analyze_patch
+        from static import Map, analyze_patch, import_check_modules
 
         M = Map(MAP, tests)
     except Exception as exc:  # noqa: BLE001
         log(f"map unavailable ({exc!r}): selecting every test")
         M = None
+    ctx = {"dsec": dsec, "dms": dms, "id_of": id_of, "num_of": num_of, "file_tests": file_tests,
+           "M": M, "costs": Costs(COST, tests), "replay": None}
+    try:
+        with open(REPLAY, encoding="utf-8") as fh:
+            ctx["replay"] = json.load(fh)
+    except Exception as exc:  # noqa: BLE001
+        log(f"replay baseline unavailable ({exc!r}): TPC tests are not replayed")
     dyn_ok = DYNAMIC
     if dyn_ok:
         try:
@@ -233,29 +488,26 @@ def main() -> int:
                     select = set(all_tests)
                     log(f"{cid}: broad | {'; '.join(A.notes)[:200]}")
                 else:
-                    broken = import_breaks(A, M, cid) if dyn_ok else set()
-                    if broken:
-                        A.cands |= broken
                     cands = {n for n in A.cands | set(M.unmapped) if n in dms}
-                    probed = make_probe(A, cid) if dyn_ok else None
-                    run_ids, keep, why = (choose_verify(A, cands, dsec, dms, probed is not None)
-                                          if dyn_ok else ([], sorted(cands), "static"))
-                    elapsed = time.monotonic() - t0
-                    if run_ids and elapsed + OVERHEAD_S + 3 * sum(dsec[n] for n in run_ids) > wall_budget:
-                        run_ids, keep, why = [], sorted(cands), "out of time budget: static"
-                    if run_ids:
-                        costly_ms = pack(keep, dms)[0] if keep else 0
-                        abort = probed is not None and costly_ms >= 0.7 * pack(sorted(cands), dms)[0]
-                        failing, clean = verify(A, run_ids, id_of, num_of, file_tests, dsec, cid, probed, abort)
-                        if clean and not failing:
-                            # weak-mutation evidence from cheap tests is only trusted for the huge
-                            # tests; moderately costly ones stay selected
-                            select = {n for n in keep if dsec[n] <= HUGE_S}
-                            why += f" | probe: never visible -> {len(keep) - len(select)} huge costly dropped"
-                        else:
-                            select = set(keep) | failing
+                    # modules whose import could now raise: checked inside the verification
+                    # run when there is one, else in a child of their own
+                    mods = import_check_modules(A, REPO) if dyn_ok else []
+                    ctx["imports"] = {"mods": mods, "res": None}
+                    if dyn_ok and cands:
+                        probed = make_probe(A, cid)
+                        time_left = wall_budget - (time.monotonic() - t0)
+                        select, why = decide(A, cands, ctx, cid, probed, time_left)
                     else:
-                        select = set(keep)
+                        select, why = set(cands), ("static" if cands else "no candidates")
+                    if mods:
+                        res = ctx["imports"]["res"]
+                        if res is None:
+                            res = import_check(A, mods, cid)
+                        broken = {n for n in import_breaks(M, mods, res, cid) if n in dms}
+                        if broken - select:
+                            why += f" | +{len(broken - select)} users of modules that no longer import"
+                            select = set(select) | broken
+                            cands |= broken
                     log(f"{cid}: {len(cands)} cands -> {len(select)} | {why} | {'; '.join(A.notes)[:200]}")
             except _Late:
                 log(f"{cid}: analysis over its time limit: selecting every test")
@@ -275,11 +527,14 @@ def main() -> int:
     return 0
 
 
-def verify(A, run_ids, id_of, num_of, file_tests, dsec, cid, probed=None, abort=False) -> tuple[set[int], bool]:
-    """Run the cheap candidates on the patched tree; keep failures and anything uncertain.
+def verify(A, run_ids, id_of, num_of, file_tests, dsec, cid, probed=None, abort=False,
+           imports=None) -> tuple[set[int], bool, bool]:
+    """Run candidates on the patched tree; keep failures and anything uncertain.
 
-    Returns (tests to keep, clean): clean is True only when a probe watched the changed
-    expression, the tests reached it, and its value never differed from the original's.
+    Returns (tests to keep, clean, aborted): clean is True only when a probe watched the
+    changed expression, the tests reached it, and its value never differed from the
+    original's; aborted is True when the run was stopped at the first visible difference
+    (nothing is then known about the tests, and all are returned).
     """
     import warm
     from runner import build_overlay
@@ -299,12 +554,15 @@ def verify(A, run_ids, id_of, num_of, file_tests, dsec, cid, probed=None, abort=
         import resource
 
         r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
-        res = warm.run(overlay, [id_of[n] for n in run_ids], WORK, limit, per_test, report, abort)
+        want = imports["mods"] if imports is not None and imports["res"] is None else None
+        res = warm.run(overlay, [id_of[n] for n in run_ids], WORK, limit, per_test, report, abort, want or None)
+        if want and res.get("imports") is not None:
+            imports["res"] = res["imports"]
         r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
         log(f"{cid}: verify cpu {r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime:.2f}s wall {res['seconds']:.2f}s")
     except Exception as exc:  # noqa: BLE001
         log(f"{cid}: verification failed to run ({exc!r}): keeping all")
-        return set(run_ids), False
+        return set(run_ids), False, False
     finally:
         shutil.rmtree(overlay, ignore_errors=True)
     if res["timed_out"]:
@@ -312,10 +570,10 @@ def verify(A, run_ids, id_of, num_of, file_tests, dsec, cid, probed=None, abort=
             import probe
 
             if probe.read_report(report)[1]:
-                log(f"{cid}: probe saw the change take effect: stopped early, keeping all")
-                return set(run_ids), False
+                log(f"{cid}: probe saw the change take effect: stopped early")
+                return set(run_ids), False, True
         log(f"{cid}: verification timed out after {res['seconds']:.1f}s: keeping all")
-        return set(run_ids), False
+        return set(run_ids), False, False
     keep = {num_of[x] for x in res["failed"] if x in num_of}
     seen = {num_of[x] for x in res["seen"] if x in num_of}
     keep |= set(run_ids) - seen  # never reported: cannot vouch for it
@@ -329,7 +587,7 @@ def verify(A, run_ids, id_of, num_of, file_tests, dsec, cid, probed=None, abort=
         evaluated, infected, fallback = probe.read_report(report)
         clean = evaluated and not infected and not fallback and not res["errors"]
         log(f"{cid}: probe evaluated={evaluated} infected={infected} fallback={fallback}")
-    return keep, clean
+    return keep, clean, False
 
 
 if __name__ == "__main__":
