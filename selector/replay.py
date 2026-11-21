@@ -916,7 +916,10 @@ def _iso_build_child(repo: str, out_path: str, base_path: str, mode: str, tmpdir
         json.dump(got, fh)
 
 
-def build_iso(repo: str, base_path: str, tmpdir: str) -> dict:
+ISO_BUILD_BUDGET_S = 420.0  # the image build has 10 minutes: past this point of the replay build, no recordings
+
+
+def build_iso(repo: str, base_path: str, tmpdir: str, deadline: float | None = None) -> dict:
     """The "iso" section of the baseline file: per TPC-DS query and mode (trees / with the
     executor), the leftover signature of its isolated run (None unless two processes with
     different hash seeds reproduce the baseline and agree on it) and its CPU seconds."""
@@ -924,22 +927,33 @@ def build_iso(repo: str, base_path: str, tmpdir: str) -> dict:
 
     with open(base_path, encoding="utf-8") as fh:
         n = len(json.load(fh)["tests"][T_TPCDS])
+    import time
+
     out: dict = {"t": {T_TPCDS: {}}, "sig": {T_TPCDS: {}}, "skip": []}
     recs: dict = {}
+    procs = []  # the four recordings run side by side (the build has 4 cores)
     for mode in ("trees", "full"):
-        procs = []
         for seed in ("1", "777"):
             op = os.path.join(tmpdir, f"iso-{mode}-{seed}.json")
             env = dict(os.environ, PYTHONHASHSEED=seed, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1")
             procs.append((subprocess.Popen([sys.executable, os.path.abspath(__file__), "_iso", repo, op,
-                                            base_path, mode, tmpdir], env=env), op))
-        runs = []
-        for proc, op in procs:
-            if proc.wait() != 0:
+                                            base_path, mode, tmpdir], env=env, start_new_session=True), op, mode))
+    try:
+        for proc, op, mode in procs:
+            left = None if deadline is None else max(1.0, deadline - time.monotonic())
+            if proc.wait(timeout=left) != 0:
                 raise RuntimeError("iso recording failed")
             with open(op, encoding="utf-8") as fh:
-                runs.append(json.load(fh))
-        recs[mode] = runs
+                recs.setdefault(mode, []).append(json.load(fh))
+    except BaseException:
+        import signal
+
+        for proc, _, _ in procs:  # over the time budget, or failed: stop them all (and their forks)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        raise
     # static paths whose value differs between the two hash seeds in any query's run: their
     # value is arbitrary at the pinned commit too (e.g. a loop variable over a set left in a
     # class body), so no signature includes them
@@ -1312,6 +1326,9 @@ def _merge_stable(a, b):
 
 def build(repo: str, out_path: str) -> None:
     import tempfile
+    import time
+
+    t_start = time.monotonic()
 
     tmpdir = tempfile.mkdtemp(prefix="replay-build-")
     reach_procs = start_reach(repo, tmpdir) if hasattr(sys, "monitoring") else None
@@ -1348,11 +1365,12 @@ def build(repo: str, out_path: str) -> None:
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, separators=(",", ":"))
     try:
-        doc["iso"] = build_iso(repo, out_path, tmpdir)
+        doc["iso"] = build_iso(repo, out_path, tmpdir, t_start + ISO_BUILD_BUDGET_S)
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump(doc, fh, separators=(",", ":"))
     except Exception as exc:  # noqa: BLE001 - without it the selector does what v6 does
-        print(f"replay iso: recording failed ({exc!r}): no isolated replays", file=sys.stderr)
+        print(f"replay iso: recording failed or over its time budget ({exc!r}): no isolated replays", file=sys.stderr)
+    print(f"replay build: {time.monotonic() - t_start:.0f}s", file=sys.stderr)
     import shutil
 
     shutil.rmtree(tmpdir, ignore_errors=True)
