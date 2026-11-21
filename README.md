@@ -24,8 +24,8 @@ them across workers.
 
 ## Data files
 
-Everything the image ships or builds is made from the pinned sqlglot commit (eb11aec) alone.
-Nothing is stored per patch or per kind of edit, and no file says which tests an edit breaks:
+Every data file the image ships or builds is made from the pinned sqlglot commit (eb11aec) alone.
+None stores anything per patch or per kind of edit, and none says which tests an edit breaks:
 every decision about a commit is derived from that commit's diff when the selector runs.
 
 - `map/blast.map` (shipped): for each test, the sqlglot lines it executed (function bodies and
@@ -48,6 +48,11 @@ When a patch is exactly one `is` <-> `==` or `is not` <-> `!=` swap, `selector/s
 the classes recorded at that comparison and works out from Python's comparison rules whether
 equality and identity can differ for them. If they cannot, no test can observe the change and
 none is selected; otherwise the usual rules apply. `BR_CMP=0` turns this off.
+
+Outside the data files, the only numbers tied to a kind of change are the `GAIN_*` constants in
+`selector/main.py`: how often running the candidates first pays off for an edit inside a function
+body, for a declaration, and for a replayed TPC test. They only decide whether candidates are run
+against the patched code before being selected.
 
 Third-party code: sqlglot (MIT, fetched at build time) and the packages in
 `requirements.lock` (the kit's environment). Python standard library otherwise.
