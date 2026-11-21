@@ -719,6 +719,24 @@ def _block_word(text: str) -> str:
     return ""
 
 
+def _line_binds(text: str) -> frozenset:
+    """The names one line binds when it is a statement of its own (assignment targets, imported
+    names, def and class names); for the first line of a longer statement, the text left of its
+    `=`. Used to see whether a replaced line at class or module level defines other names."""
+    t = text.strip()
+    try:
+        names: set[str] = set()
+        for n in ast.walk(ast.parse(t)):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(n.name)
+            elif isinstance(n, ast.stmt):
+                names |= _assigned_names(n)
+        return frozenset(names)
+    except (SyntaxError, ValueError, RecursionError):
+        m = re.match(r"([^=(\[{]*?)(?<![=!<>+\-*/%&|^:@])=(?!=)", t)
+        return frozenset({"?" + m.group(1).strip()}) if m else frozenset()
+
+
 def _inner_stmt(stmts: list, line: int):
     best = None
     for s0, s1, node in stmts:
@@ -786,6 +804,11 @@ def _scope_rule(path: str, fc: FileChange, new_src: str, origin: list, sc: FileS
             io, inw = len(old_text) - len(old_text.lstrip()), len(new_text) - len(new_text.lstrip())
             if _block_word(old_text) != _block_word(new_text) or (io != inw and _is_code_line(old_text) and _is_code_line(new_text)):
                 top.append(f"{old_no}")
+            elif _line_binds(new_text) - _line_binds(old_text):
+                # the line now defines a name it did not define before (a target renamed to an
+                # attribute the class inherits): the rules above know the readers of the OLD names
+                # only. A name that is merely no longer defined is theirs.
+                top.append(f"{old_no} binds other names")
     paired_old = {t[0] for t in replacement_targets(fc)}
     paired_new = {t[1] for t in replacement_targets(fc)}
     for ln in removed:
@@ -801,7 +824,7 @@ def _scope_rule(path: str, fc: FileChange, new_src: str, origin: list, sc: FileS
         A.cands |= users
         A.opaque = True
         A.changes.append((path, "import", 0, 0))
-        A.notes.append(f"{path}:{','.join(top[:4])} a block opens, closes or moves at class or module level -> all {len(users)} users")
+        A.notes.append(f"{path}:{','.join(top[:4])} a line at class or module level regroups statements or binds other names -> all {len(users)} users")
 
     def wide(f, why: str, everyone: bool = False) -> None:
         more = set(users) if everyone else (M.rt_lines(path, f[0], f[1]) | M.imp_lines(path, f[2], f[1]))
