@@ -484,7 +484,8 @@ def exec_lines_touched(base: dict, changes) -> bool:
 # behind that another query reads. The isolated replay runs each of those queries alone, in a
 # fork made right after set-up (the state the reach map's "fresh" arrangement was recorded
 # from, and the state every pool worker of the real test starts from), and requires of each:
-# its baseline result, no time-out, and the same signature of what the run leaves behind as
+# its baseline result, no time-out, the baseline result again when run a second time in the
+# state its first run left, and the same signature of what the first run leaves behind as
 # the pinned code left when the image was built:
 #   (1) every object created during the run and still alive after a collection: its type and
 #       its content two levels deep (atoms by value);
@@ -790,6 +791,19 @@ def _iso_one(tid: str, i: int, b, skip_exec_ok: bool, limits, static0: dict, tab
                         globals0, modules0)
         if sig is not None and skip is not None:
             sig = _sig(sig[0], sig[1], skip)
+        # ... and once more in the state its own first run left (caches it filled are now
+        # warm): a changed line that only misbehaves on a cache hit shows here
+        _arm()
+        try:
+            again = run_one(tid, b, skip_exec_ok, notes.append, only={i}, limits=limits, strict_trees=True) is True
+        except BaseException as exc:  # noqa: BLE001
+            again = False
+            notes.append(f"second run raised {type(exc).__name__}")
+        finally:
+            _disarm()
+        if not again:
+            ok = False
+            notes.append("second run in its own warm state differs")
     return [ok, sig, round(dt, 4), notes]
 
 

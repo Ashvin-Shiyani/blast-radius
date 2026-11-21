@@ -79,7 +79,7 @@ P_LIM = float(os.environ.get("BR_P_LIM", "0.5"))  # share of limited replays tha
 # the plain replay, which follows whenever it proves nothing. BR_ISO=0 restores v6 exactly
 # (and removes the per-query CPU limits of the plain replay).
 ISO = os.environ.get("BR_ISO", "1") == "1"
-ISO_PER_QUERY_S = float(os.environ.get("BR_ISO_PER_QUERY", "0.08"))  # fork + collection + signature
+ISO_PER_QUERY_S = float(os.environ.get("BR_ISO_PER_QUERY", "0.1"))  # fork + collection + signature (measured 0.09-0.11)
 ISO_MAX_SHARE = float(os.environ.get("BR_ISO_SHARE", "0.6"))
 P_ISO = float(os.environ.get("BR_P_ISO", "0.5"))  # share of isolated replays that prove "unchanged"
 ISO_HEUR_MAX_S = float(os.environ.get("BR_ISO_HEUR_MAX", "1.5"))  # dearest proof asked in place of the clean-probe heuristic
@@ -267,7 +267,8 @@ def iso_target(A, base, skip_exec_ok: bool):
         secs = base["iso"]["t"][tid][mode]
         if not qs or any(sig[i] is None or secs[i] is None for i in qs):
             return None
-        cost = sum(secs[i] for i in qs) + ISO_PER_QUERY_S * len(qs) + (0.0 if skip_exec_ok else LIM_TABLES_S)
+        # (every query runs twice: alone, then again in the state its first run left)
+        cost = 2 * sum(secs[i] for i in qs) + ISO_PER_QUERY_S * len(qs) + (0.0 if skip_exec_ok else LIM_TABLES_S)
         return sorted(qs), cost
     except Exception:  # noqa: BLE001
         return None
