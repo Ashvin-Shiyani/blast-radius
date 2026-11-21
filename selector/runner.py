@@ -43,10 +43,14 @@ def build_overlay(repo: str, root: str, new_files: dict[str, bytes | None]) -> N
             rel = f"{rel_dir}/{name}" if rel_dir else name
             if rel in new_files:
                 continue
-            if rel in real_dirs:
+            src = os.path.join(src_dir, name)
+            in_tests = rel == "tests" or rel.startswith("tests/")
+            if rel in real_dirs or (in_tests and os.path.isdir(src) and name not in ("fixtures", "__pycache__")):
                 fill(rel)
+            elif in_tests and name.endswith(".py"):
+                shutil.copy2(src, os.path.join(dst_dir, name))  # keeps mtime: cached bytecode stays valid
             else:
-                os.symlink(os.path.join(src_dir, name), os.path.join(dst_dir, name))
+                os.symlink(src, os.path.join(dst_dir, name))
         for rel, content in new_files.items():
             if os.path.dirname(rel) == rel_dir and content is not None:
                 with open(os.path.join(root, rel), "wb") as fh:

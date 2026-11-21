@@ -423,7 +423,14 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
         A.notes.append(f"{fc.path}: pytest config")
         return
     if fc.is_new or not os.path.isfile(old_file):
-        A.notes.append(f"{fc.path}: new python file, imported by nothing at the base commit")
+        hit: set[int] = set()
+        R = _refs()
+        if R is not None:
+            for n in ("iter_modules", "walk_packages", "listdir", "scandir", "glob", "iglob", "rglob"):
+                for f, ln in R.lines(n):
+                    hit |= M.rt_lines(f, ln, ln) | M.imp_lines(f, ln, ln)
+        A.cands |= hit
+        A.notes.append(f"{fc.path}: new python file: {len(hit)} tests that list packages/directories")
         return
     users = M.file_users(path)
     if fc.is_deleted or fc.is_rename or (fc.new_path and fc.old_path and fc.new_path != fc.old_path):
@@ -440,6 +447,15 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     A.new_sources[path] = new_src
     old_tok = significant_tokens(old_src)
     new_tok = significant_tokens(new_src)
+    head_changed = any(ln <= 2 for ln in fc.removed) or any(a < 2 for a in fc.added_after)
+    if head_changed:
+        try:  # a coding cookie on line 1-2 is honoured when the file is imported
+            compile(new_src.encode("utf-8", "surrogateescape"), path, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError, LookupError, UnicodeDecodeError):
+            A.cands |= users
+            A.import_break |= users
+            A.notes.append(f"{fc.path}: file no longer decodes/compiles -> {len(users)} users")
+            return
     if old_tok is not None and old_tok == new_tok:
         A.notes.append(f"{fc.path}: comments/blank lines only")
         return
@@ -452,6 +468,12 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
         A.cands |= users
         A.import_break |= users
         A.notes.append(f"{fc.path}: patched file does not compile -> {len(users)} users")
+        return
+    if len(fc.removed) + len(fc.added_text) > 200:
+        # a sweeping edit: line-level precision is not worth the time; everyone who loads it
+        A.cands |= users
+        A.notes.append(f"{fc.path}: {len(fc.removed) + len(fc.added_text)} changed lines -> all {len(users)} users")
+        A.changes.append((path, "import", 1, 1))
         return
     sc = FileScopes(old_src)
     old_lines = old_src.split("\n")
@@ -547,12 +569,30 @@ def _touches_pytest_section(fc: FileChange, repo: str) -> bool:
     return any("pytest" in section(ln) for ln in lines if ln >= 1)
 
 
+def _config_parses(fc: FileChange, repo: str) -> bool:
+    """pytest reads these files at start-up: one that no longer parses stops every test."""
+    try:
+        old = open(os.path.join(repo, fc.old_path or fc.path), encoding="utf-8").read()
+        new = apply_hunks_with_origin(old, fc)[0]
+        if fc.path.endswith(".toml"):
+            import tomllib
+
+            tomllib.loads(new)
+        else:
+            import configparser
+
+            configparser.ConfigParser(interpolation=None).read_string(new)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def analyze_data(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     base = os.path.basename(fc.path)
     if base in PYTEST_CONFIG and (fc.path.count("/") == 0 or base in ("conftest.py", "pytest.ini")):
-        if _touches_pytest_section(fc, repo):
+        if _touches_pytest_section(fc, repo) or not _config_parses(fc, repo):
             A.broad = True
-            A.notes.append(f"{fc.path}: pytest config")
+            A.notes.append(f"{fc.path}: pytest config (or no longer parses)")
             return
         A.notes.append(f"{fc.path}: config outside pytest sections")
     hit: set[int] = set()
@@ -593,9 +633,14 @@ def analyze_patch(text: str, repo: str, M: Map) -> Analysis:
 
 def import_check_modules(A: "Analysis", repo: str) -> list[str]:
     """Modules whose import could now raise: those with import-time or signature changes,
-    plus sqlglot modules that read the changed names or class at import (subclass bodies)."""
+    plus sqlglot modules that read the changed names or class at import (subclass bodies).
+    Each file is parsed once and at most 60 changed statements are examined (huge patches
+    still get their own modules checked)."""
     mods: list[str] = []
     R = _refs()
+    scopes: dict[str, FileScopes | None] = {}
+    names: set[str] = set()
+    examined = 0
     for path, kind, lo, hi in A.changes:
         if kind in ("body", "lambda"):
             continue
@@ -603,25 +648,28 @@ def import_check_modules(A: "Analysis", repo: str) -> list[str]:
             m = _module_of(path)
             if m not in mods:
                 mods.append(m)
-        if R is None:
+        if R is None or lo <= 0 or examined >= 60:
             continue
-        src = A.new_sources.get(path)
-        names: set[str] = set()
-        try:
-            sc = FileScopes(open(os.path.join(repo, path), encoding="utf-8").read())
-            node = sc.stmt_node_of(lo) if lo > 0 else None
-            names |= _assigned_names(node) if node is not None else set()
-            chain = sc.class_chain(lo) if lo > 0 else []
-            if chain:
-                names.add(chain[0][2])
-        except Exception:  # noqa: BLE001
-            pass
-        for n in names:
-            if R.count(n) > COMMON_LIMIT:
-                continue
-            for f, ln, flags in R.entries(n):
-                if f.startswith("sqlglot/") and not (flags & 4):
-                    m = _module_of(f)
-                    if m not in mods:
-                        mods.append(m)
+        examined += 1
+        if path not in scopes:
+            try:
+                scopes[path] = FileScopes(open(os.path.join(repo, path), encoding="utf-8").read())
+            except Exception:  # noqa: BLE001
+                scopes[path] = None
+        sc = scopes[path]
+        if sc is None:
+            continue
+        node = sc.stmt_node_of(lo)
+        names |= _assigned_names(node) if node is not None else set()
+        chain = sc.class_chain(lo)
+        if chain:
+            names.add(chain[0][2])
+    for n in sorted(names):
+        if R.count(n) > COMMON_LIMIT:
+            continue
+        for f, ln, flags in R.entries(n):
+            if f.startswith("sqlglot/") and not (flags & 4):
+                m = _module_of(f)
+                if m not in mods:
+                    mods.append(m)
     return mods[:80]

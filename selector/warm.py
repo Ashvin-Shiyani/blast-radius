@@ -22,6 +22,18 @@ import time
 _WARM = False
 
 
+def _kill(pid: int) -> None:
+    for target in (-pid, pid):
+        try:
+            os.kill(target, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+
+
 def warm_up() -> None:
     global _WARM
     if _WARM:
@@ -138,20 +150,19 @@ def run(overlay: str, test_ids: list[str], workdir: str, timeout_s: float, per_t
             code = 1
         os._exit(code)
     timed_out = False
-    while True:
-        done, _ = os.waitpid(pid, os.WNOHANG)
-        if done:
-            break
-        if time.monotonic() - t0 > timeout_s:
-            timed_out = True
-            for target in (-pid, pid):
-                try:
-                    os.kill(target, signal.SIGKILL)
-                except OSError:
-                    pass
-            os.waitpid(pid, 0)
-            break
-        time.sleep(0.005)
+    try:
+        while True:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            if time.monotonic() - t0 > timeout_s:
+                timed_out = True
+                _kill(pid)
+                break
+            time.sleep(0.005)
+    except BaseException:
+        _kill(pid)
+        raise
     res = {"failed": set(), "seen": set(), "errors": set(), "timed_out": timed_out,
            "seconds": time.monotonic() - t0}
     if os.path.exists(out):
@@ -199,19 +210,18 @@ def check_imports(overlay: str, modules: list[str], workdir: str, timeout_s: flo
         finally:
             os._exit(0)
     t0 = time.monotonic()
-    while True:
-        done, _ = os.waitpid(pid, os.WNOHANG)
-        if done:
-            break
-        if time.monotonic() - t0 > timeout_s:
-            for target in (-pid, pid):
-                try:
-                    os.kill(target, signal.SIGKILL)
-                except OSError:
-                    pass
-            os.waitpid(pid, 0)
-            return None
-        time.sleep(0.005)
+    try:
+        while True:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            if time.monotonic() - t0 > timeout_s:
+                _kill(pid)
+                return None
+            time.sleep(0.005)
+    except BaseException:
+        _kill(pid)
+        raise
     try:
         with open(out) as fh:
             d = json.load(fh)

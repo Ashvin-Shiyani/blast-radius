@@ -32,6 +32,7 @@ WORK = os.environ.get("BR_WORK", "/tmp/br")
 DYNAMIC = os.environ.get("BR_DYNAMIC", "1") == "1"
 
 CHEAP_S = 1.0  # tests at most this long (recorded) may be verified by running them
+HUGE_S = 3.0  # a clean probe drops only costly tests longer than this; shorter ones stay
 MAX_VERIFY_S = 6.0  # never verify a commit whose cheap candidates add up to more than this
 MAX_VERIFY_PROBE_S = 14.0  # ... unless a probe could drop costly candidates (cost model decides)
 OVERHEAD_S = 0.45  # fork + sqlglot import + collection, per verified commit (scorer CPU)
@@ -202,10 +203,28 @@ def main() -> int:
         except OSError as exc:
             log(f"no work dir ({exc!r}): static only")
             dyn_ok = False
+    import signal
+
+    class _Late(BaseException):  # not an Exception: no verification handler may swallow it
+        pass
+
+    def _alarm(signum, frame):
+        raise _Late()
+
+    signal.signal(signal.SIGALRM, _alarm)
+    hard_budget = WALL_PER_COMMIT_S * len(commits) * 0.8  # the run's limit, with margin
     lines = []
     for cid in commits:
         select = None
-        if M is not None:
+        remaining = hard_budget - (time.monotonic() - t0)
+        margin = min(10.0, 0.2 * hard_budget)  # time kept back to print the remaining answers
+        if remaining < margin + 1.0:
+            log(f"{cid}: out of time: selecting every test")
+            M_use = None
+        else:
+            M_use = M
+            signal.setitimer(signal.ITIMER_REAL, max(1.0, min(60.0, remaining - margin)))
+        if M_use is not None:
             try:
                 with open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="surrogateescape") as fh:
                     text = fh.read()
@@ -229,16 +248,23 @@ def main() -> int:
                         abort = probed is not None and costly_ms >= 0.7 * pack(sorted(cands), dms)[0]
                         failing, clean = verify(A, run_ids, id_of, num_of, file_tests, dsec, cid, probed, abort)
                         if clean and not failing:
-                            why += " | probe: never visible -> costly dropped"
-                            select = set()
+                            # weak-mutation evidence from cheap tests is only trusted for the huge
+                            # tests; moderately costly ones stay selected
+                            select = {n for n in keep if dsec[n] <= HUGE_S}
+                            why += f" | probe: never visible -> {len(keep) - len(select)} huge costly dropped"
                         else:
                             select = set(keep) | failing
                     else:
                         select = set(keep)
                     log(f"{cid}: {len(cands)} cands -> {len(select)} | {why} | {'; '.join(A.notes)[:200]}")
+            except _Late:
+                log(f"{cid}: analysis over its time limit: selecting every test")
+                select = None
             except Exception as exc:  # noqa: BLE001
                 log(f"{cid}: analysis failed ({exc!r}): selecting every test")
                 select = None
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
         if select is None:
             select = set(all_tests)
         _, workers = pack(sorted(n for n in select if n in dms), dms)
