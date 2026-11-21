@@ -475,5 +475,102 @@ class Audit(unittest.TestCase):
         self.assertEqual([h for h in hits if h not in allowed], [])
 
 
+class EndToEnd(unittest.TestCase):
+    """The rule through `analyze_patch`, with the shipped maps, on the swap of the organisers' sample
+    (dialect.py: `self.normalization_strategy is NormalizationStrategy.UPPERCASE`)."""
+
+    OLD = "            if self.normalization_strategy is NormalizationStrategy.UPPERCASE\n"
+    NEW = "            if self.normalization_strategy == NormalizationStrategy.UPPERCASE\n"
+    PATH = "sqlglot/dialects/dialect.py"
+
+    @classmethod
+    def setUpClass(cls):
+        import difflib
+        import json
+        import tempfile
+
+        root = os.path.join(HERE, "..")
+        cls.map_path = os.environ.get("BR_MAP") or os.path.join(root, "map", "blast.map")
+        cls.cmp_path = os.path.join(os.path.dirname(cls.map_path), "cmp.json")
+        with open(os.path.join(REPO, cls.PATH), encoding="utf-8") as fh:
+            old = fh.readlines()
+        assert old.count(cls.OLD) == 1
+        new = [cls.NEW if line == cls.OLD else line for line in old]
+        cls.patch = f"diff --git a/{cls.PATH} b/{cls.PATH}\n" + "".join(
+            difflib.unified_diff(old, new, f"a/{cls.PATH}", f"b/{cls.PATH}", n=3))
+        cls.other = cls.patch.replace("+" + cls.NEW, "+" + cls.NEW.replace("==", "!="))
+        with open(cls.cmp_path, encoding="utf-8") as fh:
+            cls.doc = json.load(fh)
+        with open(os.path.join(os.path.dirname(cls.map_path), "..", "tests.json")
+                  if os.path.exists(os.path.join(os.path.dirname(cls.map_path), "..", "tests.json"))
+                  else os.environ["BR_TESTS"], encoding="utf-8") as fh:
+            cls.tests = json.load(fh)["tests"]
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.M = static.Map(cls.map_path, cls.tests)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+        os.environ.pop("BR_CMPMAP", None)
+        static._CMP_DOC = static._CMP_FRESH = None
+        static.CMP = True
+
+    def run_with(self, doc=None, raw=None, missing=False, patch=None, cmp=True):
+        import json
+
+        p = os.path.join(self.tmp.name, "cmp.json")
+        if missing:
+            p = os.path.join(self.tmp.name, "nothing-here.json")
+        elif raw is not None:
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(raw)
+        else:
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+        os.environ["BR_CMPMAP"] = p
+        static._CMP_DOC = static._CMP_FRESH = None
+        static.CMP = cmp
+        A = static.analyze_patch(patch or self.patch, REPO, self.M)
+        return A, [n.split(" cmp: ", 1)[1] for n in A.notes if " cmp: " in n]
+
+    def here(self):
+        return dict(self.doc, python=list(sys.version_info[:2]))
+
+    def test_shipped_map_is_for_the_image_python(self):
+        self.assertEqual(self.doc["python"], [3, 13])
+        self.assertEqual(self.doc["v"], 1)
+
+    def test_fires_and_selects_nothing(self):
+        A, notes = self.run_with(self.here())
+        self.assertEqual(notes, ["1 class pairs, all identity-equivalent"])
+        self.assertEqual((len(A.cands), A.broad, A.changes, A.opaque), (0, False, [], False))
+
+    def test_off_gives_the_usual_candidates(self):
+        base, notes = self.run_with(self.here(), cmp=False)
+        self.assertEqual(notes, [])
+        self.assertGreater(len(base.cands), 0)
+        for kw, want in (
+            (dict(missing=True), "no class map for this Python"),
+            (dict(raw="{not json"), "no class map for this Python"),
+            (dict(doc=dict(self.doc, python=[2, 7])), "no class map for this Python"),
+            (dict(doc=dict(self.here(), v=2)), "no class map for this Python"),
+            (dict(doc=dict(self.here(), digest="0" * 64)), "class map is stale for this checkout or test list"),
+            (dict(doc=dict(self.here(), tests=self.doc["tests"][1:])), "class map is stale for this checkout or test list"),
+            (dict(doc=dict(self.here(), sites={})), None),
+            (dict(doc=dict(self.here(), classes=[])), "rule failed"),
+        ):
+            A, notes = self.run_with(**kw)
+            self.assertEqual((A.cands, A.broad, A.changes), (base.cands, base.broad, base.changes), kw.keys())
+            if want is None:
+                self.assertEqual(notes, [])
+            else:
+                self.assertTrue(notes and notes[0].startswith(want), (notes, want))
+
+    def test_another_operator_is_not_this_rule(self):
+        A, notes = self.run_with(self.here(), patch=self.other)
+        self.assertEqual(notes, [])
+        self.assertGreater(len(A.cands), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

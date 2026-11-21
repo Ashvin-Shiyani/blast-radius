@@ -15,6 +15,11 @@ jobs:
           mkdir -p /tmp/kit && cd /tmp/kit
           curl -fsSL -o kit.tgz https://www.joinbuilders.org/buildathon/tracks/blast-radius/files/blast-radius-sample.tar.gz
           tar -xzf kit.tgz && ls
+      - name: Unit tests of the identity/equality rule under the image's Python
+        run: |
+          docker run --rm --network none -v "$PWD/tests:/app/tests:ro" \
+            -v /tmp/kit/sample/tests.json:/data/tests.json:ro -e BR_TESTS=/data/tests.json \
+            --entrypoint python blast-entry -B /app/tests/test_cmp_rule.py
       - name: Run 3x with the scorer's flags and score
         run: |
           set -e
