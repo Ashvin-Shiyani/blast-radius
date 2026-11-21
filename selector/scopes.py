@@ -17,6 +17,7 @@ class FileScopes:
         self.lambdas: list[tuple[int, int, int, int]] = []
         self.classes: list[tuple[int, int, str]] = []
         self.stmts: list[tuple[int, int]] = []
+        self.stmt_nodes: list[tuple[int, int, ast.stmt]] = []
         for node in ast.walk(self.tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 start = min([d.lineno for d in node.decorator_list] + [node.lineno])
@@ -29,6 +30,7 @@ class FileScopes:
                 self.classes.append((start, node.end_lineno, node.name))
             if isinstance(node, ast.stmt):
                 self.stmts.append((node.lineno, node.end_lineno))
+                self.stmt_nodes.append((node.lineno, node.end_lineno, node))
 
     def func_of(self, line: int) -> tuple[int, int, int] | None:
         """Innermost def containing the line (decorators through end)."""
@@ -62,6 +64,17 @@ class FileScopes:
             if inside and (best is None or (l1 - l0, c1 - c0) < (best[2] - best[0], best[3] - best[1])):
                 best = (l0, c0, l1, c1)
         return (best[0], best[2]) if best else None
+
+    def stmt_node_of(self, line: int):
+        best = None
+        for s0, s1, node in self.stmt_nodes:
+            if s0 <= line <= s1 and (best is None or s1 - s0 < best[1] - best[0]):
+                best = (s0, s1, node)
+        return best[2] if best else None
+
+    def class_chain(self, line: int) -> list[tuple[int, int, str]]:
+        """Classes containing the line, outermost first."""
+        return sorted((c for c in self.classes if c[0] <= line <= c[1]), key=lambda c: (c[0], -c[1]))
 
     def lambdas_touching(self, line: int) -> list[tuple[int, int]]:
         return [(l0, l1) for (l0, _, l1, _) in self.lambdas if l0 <= line <= l1]

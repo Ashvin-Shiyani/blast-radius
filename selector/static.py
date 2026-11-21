@@ -31,6 +31,7 @@ class Map:
         self.rt: dict[str, dict[str, int]] = doc["rt"]
         self.imp: dict[str, dict[str, int]] = doc["imp"]
         self.opens: dict[str, int] = doc["opens"]
+        self.inst: dict[str, int] = doc.get("inst", {})
         self.all_tests = frozenset(t["number"] for t in tests)
         mapped = {n for n in self.to_num if n is not None}
         # tests in tests.json the map has never seen: we know nothing about them
@@ -71,6 +72,13 @@ class Map:
             for k in index.get(f, {}).values():
                 out |= self.tset(k)
         return out
+
+    def inst_tests(self, qualname: str) -> set[int] | None:
+        """Tests that instantiated the class (or a subclass); None if the map has no class data."""
+        if not self.inst:
+            return None
+        k = self.inst.get(qualname)
+        return set(self.tset(k)) if k is not None else set()
 
     def openers(self, f: str) -> set[int]:
         k = self.opens.get(f)
@@ -153,6 +161,140 @@ def _is_code_line(text: str) -> bool:
     return bool(t) and not t.startswith("#")
 
 
+_REFS = None
+COMMON_LIMIT = 400
+
+
+def _refs():
+    global _REFS
+    if _REFS is None:
+        path = os.environ.get("BR_REFS") or os.path.join(os.path.dirname(os.environ.get("BR_MAP", "/app/map/blast.map")), "refs.json")
+        try:
+            from refindex import RefIndex
+
+            _REFS = RefIndex(path)
+        except Exception:  # noqa: BLE001
+            _REFS = False
+    return _REFS or None
+
+
+def _module_of(path: str) -> str:
+    mod = path[:-3].replace("/", ".") if path.endswith(".py") else path.replace("/", ".")
+    return mod[: -len(".__init__")] if mod.endswith(".__init__") else mod
+
+
+def _import_time_users(f: str, ln: int, M: "Map", R) -> set[int]:
+    """Tests affected through an import-time line of file f: users of the class whose body
+    holds it (subclass users come with the MRO records), else everyone who imports it."""
+    q = R.class_at(f, ln)
+    if q is not None and not f.startswith("tests/"):
+        users = M.inst_tests(f"{_module_of(f)}:{q}")
+        if users:
+            return users | M.rt_lines(f, ln, ln)
+    return M.imp_lines(f, ln, ln) | M.rt_lines(f, ln, ln)
+
+
+def _users_of_name(name: str, M: "Map", R, attr_only_import: bool, skip: tuple[str, int, int]) -> set[int] | None:
+    """Tests that run code reading attributes through `name` (a class): runtime lines with
+    `name.` and import-time lines with `name.`, the latter credited to the users of the
+    class whose body holds them. None if the name is too common."""
+    if R.count(name) > COMMON_LIMIT:
+        return None
+    users: set[int] = set()
+    sf, s0, s1 = skip
+    for f, ln, flags in R.entries(name):
+        if f == sf and s0 <= ln <= s1:
+            continue
+        if not (flags & 1) or (flags & 4):
+            continue  # a mention (dict key, base list, isinstance, a word in a string) reads nothing
+        if M.rt_lines(f, ln, ln):
+            users |= M.rt_lines(f, ln, ln)
+        if M.imp_lines(f, ln, ln):
+            users |= _import_time_users(f, ln, M, R)
+    return users
+
+
+def _readers(names: set[str], M: "Map", R, skip: tuple[str, int, int]) -> set[int] | None:
+    """Tests that run code reading any of `names` (assignments excluded); None if unsafe.
+    Import-time reads inside another class's body are credited to that class's users."""
+    users: set[int] = set()
+    sf, s0, s1 = skip
+    for n in names:
+        if (n.startswith("__") and n.endswith("__")) or R.count(n) > COMMON_LIMIT:
+            return None
+        for f, ln, flags in R.entries(n):
+            if (f == sf and s0 <= ln <= s1) or (flags & 2):
+                continue
+            users |= M.rt_lines(f, ln, ln)
+            if M.imp_lines(f, ln, ln):
+                users |= _import_time_users(f, ln, M, R)
+    return users
+
+
+def _assigned_names(node) -> set[str]:
+    names: set[str] = set()
+
+    def walk(t):
+        if isinstance(t, ast.Name):
+            names.add(t.id)
+        elif isinstance(t, ast.Attribute):
+            names.add(t.attr)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                walk(e)
+        elif isinstance(t, ast.Starred):
+            walk(t.value)
+
+    if isinstance(node, ast.Assign):
+        for t in node.targets:
+            walk(t)
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        walk(node.target)
+    elif isinstance(node, (ast.Import, ast.ImportFrom)):
+        for a in node.names:
+            names.add(a.asname or a.name.split(".")[0])
+    return names
+
+
+def _refine_import_time(path: str, ln: int, st: tuple[int, int], sc: FileScopes, M: "Map",
+                        importers: set[int]) -> tuple[set[int], str]:
+    """Narrow 'everyone who imports this' to the tests that can read what the statement
+    defines: users of the enclosing class, or readers of the module-level names."""
+    R = _refs()
+    if R is None or not importers:
+        return importers, "import"
+    chain = sc.class_chain(ln)
+    if chain:
+        if path.startswith("tests/"):
+            # test classes are built by unittest (stdlib __init__): no instantiation records
+            return importers, "import/test-class"
+        users = M.inst_tests(f"{_module_of(path)}:{'.'.join(c[2] for c in chain)}")
+        if not users:
+            # never seen instantiated (stdlib-built: Enum, NamedTuple, ...): cannot narrow by users
+            return importers, "import/no-instances"
+        outer = chain[0]
+        refs = _users_of_name(outer[2], M, R, True, (path, outer[0], outer[1]))
+        if refs is None:
+            return importers, "import"
+        users |= refs
+        refined = importers & users
+        names = _assigned_names(sc.stmt_node_of(ln))
+        if names:
+            readers = _readers(names, M, R, (path, st[0], st[1]))
+            if readers is not None:
+                refined &= readers
+                return refined, f"import/class {'.'.join(c[2] for c in chain)}/attr {sorted(names)[:2]}"
+        return refined, f"import/class {'.'.join(c[2] for c in chain)}"
+    node = sc.stmt_node_of(ln)
+    names = _assigned_names(node)
+    if not names or any(n.startswith("__") and n.endswith("__") for n in names):
+        return importers, "import"
+    users = _readers(names, M, R, (path, st[0], st[1]))
+    if users is None:
+        return importers, "import"
+    return importers & users, f"import/names {sorted(names)[:3]}"
+
+
 def _rule_for_old_line(path: str, ln: int, span, sc: FileScopes, M: Map) -> tuple[set[int], str]:
     """Tests that can observe a change on line `ln` of the ORIGINAL file."""
     hit = M.rt_lines(path, ln, ln) | M.imp_lines(path, ln, ln)
@@ -168,7 +310,37 @@ def _rule_for_old_line(path: str, ln: int, span, sc: FileScopes, M: Map) -> tupl
         # decorators, def line, signature defaults: observed by everyone who calls it
         return hit | M.rt_lines(path, f[2], f[1]), "signature"
     st = sc.stmt_of(ln) or (ln, ln)
-    return hit | M.imp_lines(path, *st) | M.rt_lines(path, *st), "import"
+    importers = hit | M.imp_lines(path, *st) | M.rt_lines(path, *st)
+    refined, kind = _refine_import_time(path, ln, st, sc, M, importers)
+    # code inside the statement that runs later (lambdas in a class-level dict) stays in
+    return refined | M.rt_lines(path, *st), kind
+
+
+def replacement_targets(fc: FileChange) -> list[tuple[int, int, str, str]]:
+    """(old line, new line, old text, new text) for each 1:1 line replacement in the patch."""
+    out = []
+    for h in fc.hunks:
+        old_no, new_no = h.old_start, h.new_start
+        lines = h.lines
+        i = 0
+        while i < len(lines):
+            if lines[i].startswith("-") or lines[i].startswith("+"):
+                j = i
+                while j < len(lines) and lines[j].startswith("-"):
+                    j += 1
+                k = j
+                while k < len(lines) and lines[k].startswith("+"):
+                    k += 1
+                if j - i == 1 and k - j == 1:
+                    out.append((old_no, new_no, lines[i][1:], lines[j][1:]))
+                old_no += j - i
+                new_no += k - j
+                i = k
+            else:
+                old_no += 1
+                new_no += 1
+                i += 1
+    return out
 
 
 def _insert_new_lines(fc: FileChange) -> set[int]:
@@ -295,6 +467,7 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
                             oc = c
                     if oc is not None:
                         hit = M.imp_lines(path, oc[0], oc[1]) | M.rt_lines(path, oc[0], oc[1])
+                        hit, _ = _refine_import_time(path, oc[0], (oc[0], oc[1]), sc, M, hit)
                 if not hit:
                     hit = set(users)
                 A.cands |= hit

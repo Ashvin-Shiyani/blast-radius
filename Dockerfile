@@ -11,6 +11,9 @@ RUN python /app/build/fetch_sqlglot.py /app/sqlglot \
  && python -m compileall -q /app/sqlglot/sqlglot /app/sqlglot/tests
 COPY selector/ /app/selector/
 COPY map/ /app/map/
-RUN python -m compileall -q /app/selector && chmod -R a+rX /app
-ENV BR_DATA=/data BR_REPO=/app/sqlglot BR_MAP=/app/map/blast.map PYTHONDONTWRITEBYTECODE=1
+# identifier reference index of the pinned checkout (build CPU is not charged)
+RUN python /app/selector/refindex.py /app/sqlglot /app/map/refs.json \
+ && python -m compileall -q /app/selector && chmod -R a+rX /app
+ENV BR_DATA=/data BR_REPO=/app/sqlglot BR_MAP=/app/map/blast.map BR_REFS=/app/map/refs.json \
+    BR_WORK=/tmp/br PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector/main.py"]
