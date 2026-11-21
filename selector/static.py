@@ -36,6 +36,7 @@ class Map:
         self.opens: dict[str, int] = doc["opens"]
         self.inst: dict[str, int] = doc.get("inst", {})
         self.all_tests = frozenset(t["number"] for t in tests)
+        self.test_ids = frozenset(t["id"] for t in tests)
         mapped = {n for n in self.to_num if n is not None}
         # tests in tests.json the map has never seen: we know nothing about them
         self.unmapped = frozenset(self.all_tests - mapped)
@@ -1110,6 +1111,297 @@ def _runtime_range(path: str, ln: int, span, sc: FileScopes, kind: str) -> tuple
     return (ln, ln)
 
 
+# ---------------------------------------------------------------------------------------
+# v10: an identity operator swapped with an equality operator (`is` <-> `==`, `is not` <-> `!=`)
+#
+# `a is b` and `a == b` give the same result whenever the classes of a and b make equality the
+# same thing as identity. Which classes meet at each comparison of the pinned package is recorded
+# in map/cmp.json (classes per comparison site, nothing else). Here, at selection time, the
+# patch is checked to be exactly one such swap and nothing else; then every recorded class pair of
+# that site is judged from Python's comparison protocol (the left `__eq__`, then the reflected
+# one, then identity; `!=` through `__ne__`). If every pair is identity-equivalent the patched
+# program computes, at every execution of that comparison, the value the pinned program
+# computes, with no side effect, so no test can tell them apart and the change selects nothing.
+# Anything not proven goes to the rules below, unchanged. BR_CMP=0 turns the rule off.
+CMP = os.environ.get("BR_CMP", "1") == "1"
+_CMP_DOC = None  # None: not loaded yet; False: unavailable
+_CMP_FRESH = None
+_CMP_SWAPS = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot)}
+_CMP_TEXT = {("is", "=="), ("==", "is"), ("is not", "!="), ("!=", "is not")}
+_CMP_OBJECT = "builtins:object"
+# builtins whose __eq__/__ne__ return NotImplemented for an operand of another family
+_CMP_BUILTIN = {"builtins:int": "num", "builtins:float": "num", "builtins:complex": "num", "builtins:str": "str",
+                "builtins:bytes": "bytes", "builtins:tuple": "tuple", "builtins:list": "list", "builtins:dict": "dict",
+                "builtins:set": "set", "builtins:frozenset": "set", "builtins:range": "range", "builtins:slice": "slice",
+                "builtins:builtin_function_or_method": "bfn"}
+# families of which two different ones can never be equal (case f)
+_CMP_DISJOINT = {"num", "str", "tuple", "list", "dict", "set"}
+# the one audited `__eq__` written in the package: accepted only while its source is this text
+_CMP_EXPR = "sqlglot.expressions.core:Expression"
+_CMP_EXPR_FILE = "sqlglot/expressions/core.py"
+_CMP_EXPR_EQ = ("def __eq__(self, other: object) -> bool:\n"
+                "        return self is other or (type(self) is type(other) and hash(self) == hash(other))")
+_CMP_EXPR_NE = ("def __ne__(self, other: object) -> bool:\n"
+                "        return not self.__eq__(other)")
+
+
+def _cmp_doc():
+    """The comparison-class map, or False if it is missing, unreadable or of another Python."""
+    global _CMP_DOC
+    if _CMP_DOC is None:
+        _CMP_DOC = False
+        try:
+            import sys
+
+            p = os.environ.get("BR_CMPMAP") or os.path.join(
+                os.path.dirname(os.environ.get("BR_MAP", "/app/map/blast.map")), "cmp.json")
+            with open(p, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            if doc.get("v") == 1 and doc.get("python") == list(sys.version_info[:2]):
+                _CMP_DOC = doc
+        except Exception:  # noqa: BLE001
+            _CMP_DOC = False
+    return _CMP_DOC
+
+
+def _cmp_tree_digest(root: str) -> str:
+    """Content digest of sqlglot/ and tests/ (the digest build/fetch_sqlglot.py verifies)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    files = []
+    for part in ("sqlglot/", "tests/"):
+        for dp, dns, fns in os.walk(os.path.join(root, part)):
+            dns[:] = sorted(d for d in dns if d != "__pycache__")
+            for fn in fns:
+                if not fn.endswith(".pyc"):
+                    files.append(os.path.relpath(os.path.join(dp, fn), root))
+    for rel in sorted(files):
+        h.update(rel.encode() + b"\0")
+        with open(os.path.join(root, rel), "rb") as fh:
+            h.update(hashlib.sha256(fh.read()).digest())
+    return h.hexdigest()
+
+
+def _cmp_fresh(doc: dict, repo: str, M: "Map") -> bool:
+    """The map was recorded on exactly this checkout and every test of tests.json ran in it."""
+    global _CMP_FRESH
+    if _CMP_FRESH is None:
+        _CMP_FRESH = False
+        try:
+            _CMP_FRESH = (_cmp_tree_digest(repo) == doc["digest"]
+                          and M.test_ids <= frozenset(doc["tests"]))
+        except Exception:  # noqa: BLE001
+            _CMP_FRESH = False
+    return _CMP_FRESH
+
+
+def _cmp_swap_site(old_src: str, new_src: str, ln: int) -> tuple[int, int, int, int] | None:
+    """Position (lineno, col_offset, end_lineno, end_col_offset) of the swapped Compare in the old file."""
+    hit = _cmp_swap_nodes(old_src, new_src, ln)
+    if hit is None:
+        return None
+    n = hit[0]
+    return (n.lineno, n.col_offset, n.end_lineno, n.end_col_offset)
+
+
+_CMP_DYNAMIC = (ast.Name, ast.Attribute, ast.Call, ast.Subscript, ast.Await, ast.Yield, ast.YieldFrom,
+                ast.NamedExpr, ast.Starred)
+
+
+def _cmp_literal(e: ast.expr) -> bool:
+    """True if the compiler may see the operand as a literal other than None, True, False or
+    `...`: it warns about `is` / `is not` with one, and a warning is something a test can see.
+    Anything built without a name, an attribute, a call or a subscript counts (a superset)."""
+    if isinstance(e, ast.Constant) and (e.value is None or e.value is True or e.value is False or e.value is Ellipsis):
+        return False
+    return not any(isinstance(n, _CMP_DYNAMIC) for n in ast.walk(e))
+
+
+def _cmp_swap_nodes(old_src: str, new_src: str, ln: int):
+    """The one Compare of the old file, and its counterpart in the new file, whose operator swap
+    (is <-> ==, is not <-> !=, one operator, operands unchanged) is the whole difference between
+    the two syntax trees; None if the trees differ in any other way.
+
+    The files differ in line `ln` only (one line replaced by one line), so a statement that does
+    not touch that line has the same text at the same place in both files; it is compared by type
+    and extent. Everything on the path to the changed line is compared node by node."""
+    ol, nl = old_src.split("\n"), new_src.split("\n")
+    if len(ol) != len(nl) or ol[:ln - 1] != nl[:ln - 1] or ol[ln:] != nl[ln:]:
+        return None
+    try:
+        old_tree, new_tree = ast.parse(old_src), ast.parse(new_src)
+    except (SyntaxError, ValueError):
+        return None
+    out = []
+    stack = [(old_tree, new_tree)]
+    while stack:
+        x, y = stack.pop()
+        if type(x) is not type(y):
+            return None
+        if isinstance(x, ast.AST):
+            if (isinstance(x, ast.Compare) and len(x.ops) == 1 and len(y.ops) == 1
+                    and len(x.comparators) == 1 and len(y.comparators) == 1
+                    and type(x.ops[0]) is not type(y.ops[0])):
+                if (type(x.ops[0]), type(y.ops[0])) not in _CMP_SWAPS or out:
+                    return None
+                out.append((x, y))
+                stack.append((x.left, y.left))
+                stack.append((x.comparators[0], y.comparators[0]))
+                continue
+            for f in x._fields:
+                stack.append((getattr(x, f, None), getattr(y, f, None)))
+        elif isinstance(x, list):
+            if len(x) != len(y):
+                return None
+            if x and isinstance(x[0], ast.stmt):
+                for p, q in zip(x, y):
+                    if type(p) is not type(q):
+                        return None
+                    lo = min([d.lineno for d in getattr(p, "decorator_list", [])] + [p.lineno])
+                    if lo <= ln <= p.end_lineno:
+                        stack.append((p, q))
+                    elif ((p.lineno, p.col_offset, p.end_lineno, p.end_col_offset)
+                          != (q.lineno, q.col_offset, q.end_lineno, q.end_col_offset)):
+                        return None
+            else:
+                stack.extend(zip(x, y))
+        elif x != y or repr(x) != repr(y):
+            return None
+    if len(out) != 1:
+        return None
+    return out[0]
+
+
+def _cmp_expr_audit(repo: str, path: str, new_src: str) -> bool:
+    """True if, in the patched tree, class Expression defines `__eq__` and `__ne__` once each,
+    undecorated, with exactly the audited text, and binds those names in no other way."""
+    try:
+        if path == _CMP_EXPR_FILE:
+            src = new_src
+        else:
+            with open(os.path.join(repo, _CMP_EXPR_FILE), encoding="utf-8") as fh:
+                src = fh.read()
+        hits = [n for n in ast.parse(src).body if isinstance(n, ast.ClassDef) and n.name == "Expression"]
+        if len(hits) != 1:
+            return False
+        found = {"__eq__": [], "__ne__": []}
+        for st in ast.walk(hits[0]):
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name in found:
+                if st not in hits[0].body or st.decorator_list:
+                    return False
+                found[st.name].append(ast.get_source_segment(src, st))
+            elif isinstance(st, ast.Name) and st.id in found and not isinstance(st.ctx, ast.Load):
+                return False
+            elif isinstance(st, ast.Constant) and st.value in ("__eq__", "__ne__"):
+                return False
+        return found["__eq__"] == [_CMP_EXPR_EQ] and found["__ne__"] == [_CMP_EXPR_NE]
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _cmp_family(c: list, expr_ok) -> str:
+    """How instances of a recorded class compare: c = [class, class defining __eq__, class
+    defining __ne__, is an Enum, is a Flag, Enum members compare by identity, same facts everywhere]."""
+    key, eq, ne, _en, fl, _ok, uniq = c
+    if not uniq or fl:
+        return "other"
+    if key == "builtins:NoneType":
+        return "none"
+    if key == "builtins:bool":
+        return "bool"
+    if eq == _CMP_OBJECT and ne == _CMP_OBJECT:
+        return "default"  # object's own __eq__/__ne__: identity
+    if eq == _CMP_EXPR and ne == _CMP_EXPR:
+        return "expr" if expr_ok() else "other"
+    if eq == ne:
+        fam = _CMP_BUILTIN.get(eq)
+        if fam == "bfn":
+            return "bfn" if key == eq else "other"
+        if fam:
+            return fam
+    return "other"  # its own __eq__/__ne__, a metaclass's, a C type not listed: never equivalent
+
+
+def _cmp_pair(a: list, b: list, expr_ok) -> bool:
+    """True only if `x is y` == (`x == y`) and `x is not y` == (`x != y`) for every x of exact
+    class a and y of exact class b, with no side effect. Conservative: unlisted means False."""
+    fa, fb = _cmp_family(a, expr_ok), _cmp_family(b, expr_ok)
+    if fa == "other" or fb == "other":
+        return False
+    if fa == "none" or fb == "none":
+        return True  # a, b: nothing listed ever equals None
+    if a[3] or b[3]:  # an Enum class
+        if a[3] and b[3]:
+            if a[0] == b[0]:  # c: two members of one Enum; with a str/int mix-in only if measured
+                return fa == "default" or a[5] is True
+            return fa == "default" and fb == "default"
+        fe, fo = (fa, fb) if a[3] else (fb, fa)
+        return fe == "default" and fo in ("default", "expr")  # never an Enum member with a str or an int
+    if fa == "bool" and fb == "bool":
+        return True  # a: True and False are singletons
+    if fa == "default" or fb == "default":
+        return True  # d, e: identity on one side, NotImplemented or identity on the other
+    if fa == "expr" and fb == "expr":
+        return a[0] != b[0]  # g: two different exact Expression classes; the same class compares by hash
+    if fa == "expr" or fb == "expr":
+        return True  # g: Expression.__eq__ is False for another type, the builtin returns NotImplemented
+    ga, gb = ("num" if fa == "bool" else fa), ("num" if fb == "bool" else fb)
+    return ga != gb and ga in _CMP_DISJOINT and gb in _CMP_DISJOINT  # f; the same family is never equivalent
+
+
+def _cmp_rule(path: str, fc: FileChange, repo: str, old_src: str, new_src: str, M: "Map") -> str | None:
+    """A note about the patch as an identity/equality swap. The change is proven unobservable
+    exactly when the note ends with "all identity-equivalent"; None if it is not such a swap."""
+    try:
+        ln = fc.removed[0]
+        new_line = _replacement_pairs(fc).get(ln)
+        if new_line is None or fc.mode_change:
+            return None
+        old_line = old_src.split("\n")[ln - 1]
+        a = 0
+        while a < len(old_line) and a < len(new_line) and old_line[a] == new_line[a]:
+            a += 1
+        bo, bn = len(old_line), len(new_line)
+        while bo > a and bn > a and old_line[bo - 1] == new_line[bn - 1]:
+            bo -= 1
+            bn -= 1
+        if (old_line[a:bo].strip(), new_line[a:bn].strip()) not in _CMP_TEXT:
+            return None
+        hit = _cmp_swap_nodes(old_src, new_src, ln)
+        if hit is None:
+            return None
+        old_node, new_node = hit
+        site = (old_node.lineno, old_node.col_offset, old_node.end_lineno, old_node.end_col_offset)
+        if isinstance(new_node.ops[0], (ast.Is, ast.IsNot)) and (
+                _cmp_literal(new_node.left) or _cmp_literal(new_node.comparators[0])):
+            return "cmp: `is` with a literal operand: the compiler warns about it"
+        doc = _cmp_doc()
+        if not doc:
+            return "cmp: no class map for this Python"
+        P = doc["sites"].get(path, {}).get("%d|%d|%d|%d" % site)
+        if not P:
+            return None  # no test of the profile ran this comparison: the rules below decide
+        if isinstance(P, dict):
+            return "cmp: the classes at this comparison differ between profile runs"
+        audit = []
+
+        def expr_ok() -> bool:
+            if not audit:
+                audit.append(_cmp_expr_audit(repo, path, new_src))
+            return audit[0]
+
+        classes = doc["classes"]
+        for ia, ib in P:
+            if not _cmp_pair(classes[ia], classes[ib], expr_ok):
+                return f"cmp: {len(P)} class pairs, not all identity-equivalent ({classes[ia][0]} with {classes[ib][0]})"
+        if not _cmp_fresh(doc, repo, M):
+            return "cmp: class map is stale for this checkout or test list"
+        return f"cmp: {len(P)} class pairs, all identity-equivalent"
+    except Exception as exc:  # noqa: BLE001
+        return f"cmp: rule failed ({exc!r})"
+
+
 def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     path = fc.old_path or fc.path
     old_file = os.path.join(repo, path)
@@ -1187,6 +1479,14 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
         A.notes.append(f"{fc.path}: {len(fc.removed) + len(fc.added_text)} changed lines -> all {len(users)} users")
         A.changes.append((path, "import", 1, 1))
         return
+    if CMP and len(A.files) == 1 and len(fc.removed) == 1 and len(fc.added_text) == 1:
+        # v10: the whole patch is one line; if it is one identity/equality swap proven unobservable
+        # from the classes that meet there, it selects nothing
+        note = _cmp_rule(path, fc, repo, old_src, new_src, M)
+        if note:
+            A.notes.append(f"{path}:{fc.removed[0]} {note}")
+            if note.endswith("all identity-equivalent"):
+                return
     sc = FileScopes(old_src)
     old_lines = old_src.split("\n")
     pairs = _replacement_pairs(fc)

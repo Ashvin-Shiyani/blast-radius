@@ -22,5 +22,32 @@ them across workers.
   it and the two never differ, the change is invisible and the costly candidates are dropped.
 - `selector/pack.py` splits the selection over 1–8 workers to minimise the scored cost.
 
+## Data files
+
+Everything the image ships or builds is made from the pinned sqlglot commit (eb11aec) alone.
+Nothing is stored per patch or per kind of edit, and no file says which tests an edit breaks:
+every decision about a commit is derived from that commit's diff when the selector runs.
+
+- `map/blast.map` (shipped): for each test, the sqlglot lines it executed (function bodies and
+  import-time code apart), the files it opened and the classes it instantiated. Made by running
+  each test of the pinned checkout alone in a forked process, in this image's environment.
+- `map/cmp.json` (shipped): for each `is`, `is not`, `==`, `!=` comparison in the sqlglot package,
+  the pairs of operand classes that met there while the test suite ran; for each such class, which
+  class defines its `__eq__` and `__ne__` and whether it is an Enum; the list of tests that ran and
+  the content digest of the checkout. No test names per comparison, no verdicts. Made by running
+  the suite with every such comparison wrapped in a recorder, four times in this image's
+  environment (each test in its own forked process, and as one session; two hash seeds).
+- `map/cost.json` (shipped): CPU seconds each test takes in the selector's own test runner. Made
+  by `selector/costmap.py` on the pinned checkout, measured once on a development machine.
+- `map/refs.json` (built with the image by `selector/refindex.py`): the file and line of every
+  mention of each identifier in the checkout.
+- `map/replay.json` (built with the image by `selector/replay.py build`): hashes of what sqlglot
+  computes for each TPC query at the pinned commit, and the lines that run after optimisation.
+
+When a patch is exactly one `is` <-> `==` or `is not` <-> `!=` swap, `selector/static.py` reads
+the classes recorded at that comparison and works out from Python's comparison rules whether
+equality and identity can differ for them. If they cannot, no test can observe the change and
+none is selected; otherwise the usual rules apply. `BR_CMP=0` turns this off.
+
 Third-party code: sqlglot (MIT, fetched at build time) and the packages in
 `requirements.lock` (the kit's environment). Python standard library otherwise.
