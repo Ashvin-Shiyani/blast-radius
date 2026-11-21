@@ -94,6 +94,39 @@ def probe_target(A, repo: str):
     return fc.old_path, lo, ln, span_o, span_n
 
 
+def import_breaks(A, M, cid) -> set[int]:
+    """Tests that fail because a patched module no longer imports (e.g. a class-body
+    expression that now raises). Narrowing by class users assumes the import still works;
+    this checks it. If the check cannot run, every user of the changed modules is kept."""
+    from static import import_check_modules
+
+    mods = import_check_modules(A, REPO)
+    if not mods:
+        return set()
+    import warm
+    from runner import build_overlay
+
+    overlay = os.path.join(WORK, "ovi")
+    try:
+        build_overlay(REPO, overlay, patched_files(A, REPO))
+        res = warm.check_imports(overlay, mods, WORK, 60)
+    except Exception as exc:  # noqa: BLE001
+        log(f"{cid}: import check failed to run ({exc!r})")
+        res = None
+    finally:
+        shutil.rmtree(overlay, ignore_errors=True)
+    failed = [m for m in mods] if res is None else [m for m, ok in res.items() if not ok]
+    out: set[int] = set()
+    for m in failed:
+        rel = m.replace(".", "/")
+        for cand in (rel + ".py", rel + "/__init__.py"):
+            if os.path.exists(os.path.join(REPO, cand)):
+                out |= M.file_users(cand)
+    if failed:
+        log(f"{cid}: import check: {len(failed)} module(s) fail to import -> {len(out)} users added")
+    return out
+
+
 def make_probe(A, cid):
     """(path, probed source, report path) if the change can be watched by a probe."""
     target = probe_target(A, REPO)
@@ -181,6 +214,9 @@ def main() -> int:
                     select = set(all_tests)
                     log(f"{cid}: broad | {'; '.join(A.notes)[:200]}")
                 else:
+                    broken = import_breaks(A, M, cid) if dyn_ok else set()
+                    if broken:
+                        A.cands |= broken
                     cands = {n for n in A.cands | set(M.unmapped) if n in dms}
                     probed = make_probe(A, cid) if dyn_ok else None
                     run_ids, keep, why = (choose_verify(A, cands, dsec, dms, probed is not None)

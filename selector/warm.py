@@ -162,3 +162,60 @@ def run(overlay: str, test_ids: list[str], workdir: str, timeout_s: float, per_t
     else:
         res["timed_out"] = True
     return res
+
+
+def check_imports(overlay: str, modules: list[str], workdir: str, timeout_s: float) -> dict[str, bool] | None:
+    """Import each module from the patched overlay in a forked child (sqlglot is never imported
+    in the parent, so this is a fresh import). Returns {module: imported_ok}, or None if the
+    check itself could not run (caller must then assume the worst)."""
+    out = os.path.join(workdir, f"imp-{os.getpid()}-{time.monotonic_ns()}.json")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setpgid(0, 0)
+        except OSError:
+            pass
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        res = {}
+        try:
+            import importlib
+
+            os.chdir(overlay)
+            sys.path.insert(0, overlay)
+            os.environ["SKIP_INTEGRATION"] = "0"
+            sys.dont_write_bytecode = True
+            for m in modules:
+                try:
+                    importlib.import_module(m)
+                    res[m] = True
+                except BaseException:  # noqa: BLE001
+                    res[m] = False
+            with open(out, "w") as fh:
+                json.dump(res, fh)
+        finally:
+            os._exit(0)
+    t0 = time.monotonic()
+    while True:
+        done, _ = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        if time.monotonic() - t0 > timeout_s:
+            for target in (-pid, pid):
+                try:
+                    os.kill(target, signal.SIGKILL)
+                except OSError:
+                    pass
+            os.waitpid(pid, 0)
+            return None
+        time.sleep(0.005)
+    try:
+        with open(out) as fh:
+            d = json.load(fh)
+        os.remove(out)
+        return d
+    except (OSError, ValueError):
+        return None

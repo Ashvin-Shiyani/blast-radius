@@ -411,7 +411,7 @@ def _runtime_range(path: str, ln: int, span, sc: FileScopes, kind: str) -> tuple
         f = sc.func_of(ln)
         if f is not None:
             return sc.stmt_within(ln, f[2], f[1])
-    return (0, 0)
+    return (ln, ln)
 
 
 def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
@@ -588,3 +588,40 @@ def analyze_patch(text: str, repo: str, M: Map) -> Analysis:
         else:
             analyze_data(fc, repo, M, A)
     return A
+
+
+
+def import_check_modules(A: "Analysis", repo: str) -> list[str]:
+    """Modules whose import could now raise: those with import-time or signature changes,
+    plus sqlglot modules that read the changed names or class at import (subclass bodies)."""
+    mods: list[str] = []
+    R = _refs()
+    for path, kind, lo, hi in A.changes:
+        if kind in ("body", "lambda"):
+            continue
+        if path.endswith(".py"):
+            m = _module_of(path)
+            if m not in mods:
+                mods.append(m)
+        if R is None:
+            continue
+        src = A.new_sources.get(path)
+        names: set[str] = set()
+        try:
+            sc = FileScopes(open(os.path.join(repo, path), encoding="utf-8").read())
+            node = sc.stmt_node_of(lo) if lo > 0 else None
+            names |= _assigned_names(node) if node is not None else set()
+            chain = sc.class_chain(lo) if lo > 0 else []
+            if chain:
+                names.add(chain[0][2])
+        except Exception:  # noqa: BLE001
+            pass
+        for n in names:
+            if R.count(n) > COMMON_LIMIT:
+                continue
+            for f, ln, flags in R.entries(n):
+                if f.startswith("sqlglot/") and not (flags & 4):
+                    m = _module_of(f)
+                    if m not in mods:
+                        mods.append(m)
+    return mods[:80]
