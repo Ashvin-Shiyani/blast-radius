@@ -1,0 +1,81 @@
+
+{
+  "tests/fixtures/optimizer/annotate_functions.sql": [
+    "TestOptimizer::test_annotate_funcs"
+  ],
+  "tests/fixtures/optimizer/annotate_types.sql": [
+    "TestOptimizer::test_annotate_types"
+  ],
+  "tests/fixtures/optimizer/canonicalize.sql": [
+    "TestOptimizer::test_canonicalize"
+  ],
+  "tests/fixtures/optimizer/canonicalize_internal_names.sql": [
+    "TestOptimizer::test_canonicalize_internal_names"
+  ],
+  "tests/fixtures/optimizer/eliminate_ctes.sql": [
+    "TestOptimizer::test_eliminate_ctes"
+  ],
+  "tests/fixtures/optimizer/eliminate_joins.sql": [
+    "TestOptimizer::test_eliminate_joins"
+  ],
+  "tests/fixtures/optimizer/eliminate_subqueries.sql": [
+    "TestOptimizer::test_eliminate_subqueries"
+  ],
+  "tests/fixtures/optimizer/isolate_table_selects.sql": [
+    "TestOptimizer::test_isolate_table_selects"
+  ],
+  "tests/fixtures/optimizer/merge_subqueries.sql": [
+    "TestOptimizer::test_merge_subqueries"
+  ],
+  "tests/fixtures/optimizer/normalize.sql": [
+    "TestOptimizer::test_normalize"
+  ],
+  "tests/fixtures/optimizer/normalize_identifiers.sql": [
+    "TestOptimizer::test_normalize_identifiers"
+  ],
+  "tests/fixtures/optimizer/optimize_joins.sql": [
+    "TestOptimizer::test_optimize_joins"
+  ],
+  "tests/fixtures/optimizer/optimizer.sql": [
+    "TestOptimizer::test_optimize"
+  ],
+  "tests/fixtures/optimizer/pushdown_cte_alias_columns.sql": [
+    "TestOptimizer::test_pushdown_cte_alias_columns"
+  ],
+  "tests/fixtures/optimizer/pushdown_predicates.sql": [
+    "TestOptimizer::test_pushdown_predicates"
+  ],
+  "tests/fixtures/optimizer/pushdown_projections.sql": [
+    "TestOptimizer::test_pushdown_projection"
+  ],
+  "tests/fixtures/optimizer/qualify_columns.sql": [
+    "TestOptimizer::test_qualify_columns"
+  ],
+  "tests/fixtures/optimizer/qualify_columns__invalid.sql": [
+    "TestOptimizer::test_qualify_columns__invalid"
+  ],
+  "tests/fixtures/optimizer/qualify_columns__with_invisible.sql": [
+    "TestOptimizer::test_qualify_columns__with_invisible"
+  ],
+  "tests/fixtures/optimizer/qualify_columns_ddl.sql": [
+    "TestOptimizer::test_qualify_columns"
+  ],
+  "tests/fixtures/optimizer/qualify_tables.sql": [
+    "TestOptimizer::test_qualify_tables"
+  ],
+  "tests/fixtures/optimizer/quote_identifiers.sql": [
+    "TestOptimizer::test_quote_identifiers"
+  ],
+  "tests/fixtures/optimizer/simplify.sql": [
+    "TestOptimizer::test_simplify"
+  ],
+  "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": [
+    "TestOptimizer::test_tpcds"
+  ],
+  "tests/fixtures/optimizer/tpc-h/tpc-h.sql": [
+    "TestOptimizer::test_tpch"
+  ],
+  "tests/fixtures/optimizer/unnest_subqueries.sql": [
+    "TestOptimizer::test_unnest_subqueries"
+  ]
+}
