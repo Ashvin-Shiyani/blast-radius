@@ -20,13 +20,38 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+_ESCAPERS: dict[str, set[str]] = {}
+
+
+def _escaping_test_files(repo: str) -> set[str]:
+    hit = _ESCAPERS.get(repo)
+    if hit is None:
+        hit = set()
+        for dp, dns, fns in os.walk(os.path.join(repo, "tests")):
+            dns[:] = [d for d in dns if d not in ("fixtures", "__pycache__")]
+            for fn in fns:
+                if fn.endswith(".py"):
+                    path = os.path.join(dp, fn)
+                    try:
+                        text = open(path, encoding="utf-8", errors="replace").read()
+                    except OSError:
+                        continue
+                    if "resolve(" in text or "realpath" in text or "readlink" in text:
+                        hit.add(os.path.relpath(path, repo))
+        _ESCAPERS[repo] = hit
+    return hit
+
+
 def build_overlay(repo: str, root: str, new_files: dict[str, bytes | None]) -> None:
     """Create `root` mirroring `repo`, with `new_files` (relative path -> content, or None
     to delete) applied."""
     shutil.rmtree(root, ignore_errors=True)
     os.makedirs(root)
     real_dirs: set[str] = {""}
-    for rel in new_files:
+    # test files that resolve their own path (Path(__file__).resolve(), realpath) would follow a
+    # symlink out of the overlay: they are copied instead, and their directories made real
+    escapers = _escaping_test_files(repo)
+    for rel in list(new_files) + sorted(escapers):
         parts = rel.split("/")[:-1]
         for i in range(1, len(parts) + 1):
             real_dirs.add("/".join(parts[:i]))
@@ -44,10 +69,9 @@ def build_overlay(repo: str, root: str, new_files: dict[str, bytes | None]) -> N
             if rel in new_files:
                 continue
             src = os.path.join(src_dir, name)
-            in_tests = rel == "tests" or rel.startswith("tests/")
-            if rel in real_dirs or (in_tests and os.path.isdir(src) and name not in ("fixtures", "__pycache__")):
+            if rel in real_dirs:
                 fill(rel)
-            elif in_tests and name.endswith(".py"):
+            elif rel in escapers:
                 shutil.copy2(src, os.path.join(dst_dir, name))  # keeps mtime: cached bytecode stays valid
             else:
                 os.symlink(src, os.path.join(dst_dir, name))
