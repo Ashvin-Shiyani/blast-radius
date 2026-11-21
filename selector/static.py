@@ -18,7 +18,8 @@ from patchparse import FileChange, parse_patch
 from scopes import FileScopes, significant_tokens
 
 # Files that change how pytest itself collects or runs tests.
-PYTEST_CONFIG = {"conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml"}
+PYTEST_CONFIG = {"conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
+                 "pytest.toml", ".pytest.toml"}  # (v8: the last two are read by pytest 9)
 
 
 class Map:
@@ -737,6 +738,7 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     pairs = _replacement_pairs(fc)
     n_changes0 = len(A.changes)
     stmt_starts = {st[0] for st in sc.stmts}
+    new_src_lines = new_src.split("\n")
     # 1. modified and removed lines, judged in the original file
     for ln in sorted(set(fc.removed)):
         span = _changed_span(old_lines[ln - 1], pairs[ln]) if ln in pairs else None
@@ -746,28 +748,63 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
         A.cands |= hit
         A.notes.append(f"{path}:{ln} {kind} -> {len(hit)}")
         A.changes.append((path, kind.split("/")[0], *_runtime_range(path, ln, span, sc, kind)))
-        if kind == "body" and ln in pairs and ln in stmt_starts:
-            # v8: a statement of a function body whose line now starts further left has left
-            # its block (an `if`, a loop, a nested def): it also runs for tests that never ran
-            # the old line. Everyone who runs the outermost enclosing def; if it left that
-            # too (class body or module level), everyone who loads the file.
-            old_text, new_text = old_lines[ln - 1], pairs[ln]
-            ind_old = len(old_text) - len(old_text.lstrip())
-            ind_new = len(new_text) - len(new_text.lstrip())
-            outer = None
-            for fn in sc.funcs:
-                if fn[0] <= ln <= fn[1] and (outer is None or fn[1] - fn[0] > outer[1] - outer[0]):
-                    outer = fn
-            if ind_new < ind_old and _is_code_line(new_text) and outer is not None:
-                head = old_lines[outer[0] - 1]
-                if ind_new <= len(head) - len(head.lstrip()):
-                    more = set(users)
-                    A.changes.append((path, "import", ln, ln))
-                else:
-                    more = M.rt_lines(path, outer[0], outer[1])
-                    A.changes.append((path, "body", outer[2], outer[1]))
-                A.cands |= more
-                A.notes.append(f"{path}:{ln} moved left out of its block -> {len(more)}")
+    # 1b. v8: a statement of a function body that now starts further left has left its block (an
+    # `if`, a loop, a nested def): it also runs for tests that never ran the old line. Judged
+    # per block of the patch: if a line that starts a statement in the patched file sits left
+    # of every removed statement of that block, everyone who runs the outermost enclosing def
+    # is a candidate; if it left that def too (class body or module level), everyone who
+    # loads the file.
+    moved_sc = None
+    for h in fc.hunks:
+        old_no, new_no = h.old_start, h.new_start
+        hl = h.lines
+        i = 0
+        while i < len(hl):
+            if not (hl[i].startswith("-") or hl[i].startswith("+")):
+                old_no += 1
+                new_no += 1
+                i += 1
+                continue
+            j = i
+            while j < len(hl) and hl[j].startswith("-"):
+                j += 1
+            k = j
+            while k < len(hl) and hl[k].startswith("+"):
+                k += 1
+            gone = []
+            for t in range(i, j):
+                ln = old_no + (t - i)
+                fn = sc.func_of(ln)
+                if ln in stmt_starts and _is_code_line(hl[t][1:]) and fn is not None and fn[2] <= ln <= fn[1]:
+                    gone.append(ln)
+            if gone and k > j:
+                ind_old = min(len(old_lines[ln - 1]) - len(old_lines[ln - 1].lstrip()) for ln in gone)
+                left = [new_no + (t - j) for t in range(j, k)
+                        if _is_code_line(hl[t][1:]) and len(hl[t][1:]) - len(hl[t][1:].lstrip()) < ind_old]
+                if left:
+                    if moved_sc is None:
+                        moved_sc = FileScopes(new_src)
+                    starts_new = {st[0] for st in moved_sc.stmts}
+                    left = [n for n in left if n in starts_new]
+                if left:
+                    ln = gone[0]
+                    ind_new = min(len(new_src_lines[n - 1]) - len(new_src_lines[n - 1].lstrip()) for n in left)
+                    outer = None
+                    for fn in sc.funcs:
+                        if fn[0] <= ln <= fn[1] and (outer is None or fn[1] - fn[0] > outer[1] - outer[0]):
+                            outer = fn
+                    head = old_lines[outer[0] - 1]
+                    if ind_new <= len(head) - len(head.lstrip()):
+                        more = set(users)
+                        A.changes.append((path, "import", ln, ln))
+                    else:
+                        more = M.rt_lines(path, outer[0], outer[1])
+                        A.changes.append((path, "body", outer[2], outer[1]))
+                    A.cands |= more
+                    A.notes.append(f"{path}:{ln} moved left out of its block -> {len(more)}")
+            old_no += j - i
+            new_no += k - j
+            i = k
     # 2. inserted lines, judged in the patched file and mapped back to the original
     new_lines = new_src.split("\n")
     surplus = _insert_new_lines(fc)
@@ -888,7 +925,7 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
 def _touches_pytest_section(fc: FileChange, repo: str) -> bool:
     """True if the change edits pytest configuration inside an ini/toml/cfg file."""
     base = os.path.basename(fc.path)
-    if base in ("pytest.ini", "conftest.py") or fc.is_new or fc.is_deleted:
+    if base in ("pytest.ini", "conftest.py", "pytest.toml", ".pytest.toml") or fc.is_new or fc.is_deleted:
         return True
     try:
         old = open(os.path.join(repo, fc.old_path or fc.path), encoding="utf-8").read().split("\n")
@@ -929,7 +966,7 @@ def analyze_data(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     base = os.path.basename(fc.path)
     # (v8: also below tests/, where pytest looks first when it is given test ids)
     if base in PYTEST_CONFIG and (fc.path.count("/") == 0 or fc.path.startswith("tests/")
-                                  or base in ("conftest.py", "pytest.ini")):
+                                  or base in ("conftest.py", "pytest.ini", "pytest.toml", ".pytest.toml")):
         if _touches_pytest_section(fc, repo) or not _config_parses(fc, repo):
             A.broad = True
             A.notes.append(f"{fc.path}: pytest config (or no longer parses)")
