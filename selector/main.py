@@ -33,6 +33,7 @@ DYNAMIC = os.environ.get("BR_DYNAMIC", "1") == "1"
 
 CHEAP_S = 1.0  # tests at most this long (recorded) may be verified by running them
 MAX_VERIFY_S = 6.0  # never verify a commit whose cheap candidates add up to more than this
+MAX_VERIFY_PROBE_S = 14.0  # ... unless a probe could drop costly candidates (cost model decides)
 OVERHEAD_S = 0.45  # fork + sqlglot import + collection, per verified commit (scorer CPU)
 CPU_FACTOR = 1.25  # our CPU seconds per recorded test second, with margin
 WALL_PER_COMMIT_S = 4.5  # the limit is 3 min / ~40 commits (4.5 in the final, 1.5x commits)
@@ -127,7 +128,7 @@ def choose_verify(A, cands: set[int], dsec: dict[int, float], dms: dict[int, int
     if not cheap:
         return [], sorted(cands), "nothing cheap to verify"
     cheap_s = sum(dsec[n] for n in cheap)
-    if cheap_s > MAX_VERIFY_S:
+    if cheap_s > (MAX_VERIFY_PROBE_S if (probeable and costly) else MAX_VERIFY_S):
         return [], sorted(cands), f"cheap candidates too long to verify ({cheap_s:.1f}s)"
     static_cost = pack(sorted(cands), dms)[0] / 1000
     floor = pack(costly, dms)[0] / 1000 if costly else 0.0
@@ -233,7 +234,12 @@ def verify(A, run_ids, id_of, num_of, file_tests, dsec, cid, probed=None, abort=
         build_overlay(REPO, overlay, files)
         limit = 20 + 4 * sum(dsec[n] for n in run_ids)
         per_test = max(5.0, 5 * max(dsec[n] for n in run_ids))  # a hang is a failure; cap its cost
+        import resource
+
+        r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         res = warm.run(overlay, [id_of[n] for n in run_ids], WORK, limit, per_test, report, abort)
+        r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        log(f"{cid}: verify cpu {r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime:.2f}s wall {res['seconds']:.2f}s")
     except Exception as exc:  # noqa: BLE001
         log(f"{cid}: verification failed to run ({exc!r}): keeping all")
         return set(run_ids), False

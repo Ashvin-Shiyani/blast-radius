@@ -76,10 +76,17 @@ def _child(overlay: str, test_ids: list[str], out: str, per_test_timeout: float,
             return getattr(difflib, name)
 
     uc.difflib = _NoDiff()
-    try:
-        uc.pprint.pformat = lambda obj, *a, **k: "<obj>"
-    except Exception:  # noqa: BLE001
-        pass
+
+    class _NoPformat:  # only unittest.case's own reference: the pprint module stays intact
+        @staticmethod
+        def pformat(obj, *a, **k):
+            return "<obj>"
+
+        def __getattr__(self, name):
+            import pprint
+            return getattr(pprint, name)
+
+    uc.pprint = _NoPformat()
     orig_init = cf.ProcessPoolExecutor.__init__
 
     def capped(self, max_workers=None, mp_context=None, *a, **k):

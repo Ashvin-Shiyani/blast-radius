@@ -101,6 +101,10 @@ class Analysis:
     notes: list[str] = field(default_factory=list)
     new_sources: dict[str, str] = field(default_factory=dict)  # path -> patched text (.py)
     files: list[FileChange] = field(default_factory=list)
+    # (path, kind, lo, hi): every judged change; kind "body"/"lambda" carry the runtime line
+    # range whose executors were selected; any other kind (import, signature, data, ...) may
+    # act anywhere its module is loaded
+    changes: list[tuple[str, str, int, int]] = field(default_factory=list)
 
 
 def _changed_span(old: str, new: str) -> tuple[int, int]:
@@ -295,6 +299,32 @@ def _refine_import_time(path: str, ln: int, st: tuple[int, int], sc: FileScopes,
     return importers & users, f"import/names {sorted(names)[:3]}"
 
 
+def _strip_docstrings(tree: ast.AST) -> ast.AST:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                node.body = body[1:] or [ast.Pass()]
+    return tree
+
+
+def docstring_only(old_tok, new_tok, old_src: str, new_src: str) -> bool:
+    """True if the only differences are inside docstrings (no runtime reader of docstring
+    text exists in sqlglot or its tests)."""
+    import tokenize as _tk
+    if old_tok is None or new_tok is None or len(old_tok) != len(new_tok):
+        return False
+    if any(a != b and not (a[0] == b[0] == _tk.STRING) for a, b in zip(old_tok, new_tok)):
+        return False
+    try:
+        a = ast.dump(_strip_docstrings(ast.parse(old_src)))
+        b = ast.dump(_strip_docstrings(ast.parse(new_src)))
+    except SyntaxError:
+        return False
+    return a == b
+
+
 def _rule_for_old_line(path: str, ln: int, span, sc: FileScopes, M: Map) -> tuple[set[int], str]:
     """Tests that can observe a change on line `ln` of the ORIGINAL file."""
     hit = M.rt_lines(path, ln, ln) | M.imp_lines(path, ln, ln)
@@ -371,6 +401,19 @@ def _insert_new_lines(fc: FileChange) -> set[int]:
     return out
 
 
+def _runtime_range(path: str, ln: int, span, sc: FileScopes, kind: str) -> tuple[int, int]:
+    """Line range whose runtime executors can observe a body/lambda change at `ln`."""
+    if kind == "lambda" and span is not None:
+        lam = sc.lambda_body_at(ln, *span)
+        if lam is not None:
+            return lam
+    if kind == "body":
+        f = sc.func_of(ln)
+        if f is not None:
+            return sc.stmt_within(ln, f[2], f[1])
+    return (0, 0)
+
+
 def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     path = fc.old_path or fc.path
     old_file = os.path.join(repo, path)
@@ -396,8 +439,12 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
         return
     A.new_sources[path] = new_src
     old_tok = significant_tokens(old_src)
-    if old_tok is not None and old_tok == significant_tokens(new_src):
+    new_tok = significant_tokens(new_src)
+    if old_tok is not None and old_tok == new_tok:
         A.notes.append(f"{fc.path}: comments/blank lines only")
+        return
+    if docstring_only(old_tok, new_tok, old_src, new_src):
+        A.notes.append(f"{fc.path}: comments/blank lines only (docstrings)")
         return
     try:
         compile(new_src, path, "exec", dont_inherit=True)
@@ -415,6 +462,7 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
         hit, kind = _rule_for_old_line(path, ln, span, sc, M)
         A.cands |= hit
         A.notes.append(f"{path}:{ln} {kind} -> {len(hit)}")
+        A.changes.append((path, kind.split("/")[0], *_runtime_range(path, ln, span, sc, kind)))
     # 2. inserted lines, judged in the patched file and mapped back to the original
     new_lines = new_src.split("\n")
     surplus = _insert_new_lines(fc)
@@ -451,6 +499,8 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
                         hit |= M.rt_lines(path, of[2], of[1])
                 A.cands |= hit
                 A.notes.append(f"{path}:+{nln} body insert -> {len(hit)}")
+                of2 = sc.func_of(origin[f[0] - 1])
+                A.changes.append((path, "body", of2[2], of2[1]) if of2 else (path, "import", 0, 0))
             else:
                 # a new def, a class attribute or a module statement: runs at import and can
                 # override anything inherited, so everyone who imports the enclosing class
@@ -472,6 +522,7 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
                     hit = set(users)
                 A.cands |= hit
                 A.notes.append(f"{path}:+{nln} import-time insert -> {len(hit)}")
+                A.changes.append((path, "import", 0, 0))
 
 
 def _touches_pytest_section(fc: FileChange, repo: str) -> bool:
