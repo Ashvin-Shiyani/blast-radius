@@ -232,7 +232,8 @@ def verify(A, run_ids, id_of, num_of, file_tests, dsec, cid, probed=None, abort=
     try:
         build_overlay(REPO, overlay, files)
         limit = 20 + 4 * sum(dsec[n] for n in run_ids)
-        res = warm.run(overlay, [id_of[n] for n in run_ids], WORK, limit, 15, report, abort)
+        per_test = max(5.0, 5 * max(dsec[n] for n in run_ids))  # a hang is a failure; cap its cost
+        res = warm.run(overlay, [id_of[n] for n in run_ids], WORK, limit, per_test, report, abort)
     except Exception as exc:  # noqa: BLE001
         log(f"{cid}: verification failed to run ({exc!r}): keeping all")
         return set(run_ids), False

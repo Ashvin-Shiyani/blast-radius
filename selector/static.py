@@ -474,12 +474,36 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
                 A.notes.append(f"{path}:+{nln} import-time insert -> {len(hit)}")
 
 
+def _touches_pytest_section(fc: FileChange, repo: str) -> bool:
+    """True if the change edits pytest configuration inside an ini/toml/cfg file."""
+    base = os.path.basename(fc.path)
+    if base in ("pytest.ini", "conftest.py") or fc.is_new or fc.is_deleted:
+        return True
+    try:
+        old = open(os.path.join(repo, fc.old_path or fc.path), encoding="utf-8").read().split("\n")
+    except OSError:
+        return True
+    headers = [(i + 1, l.strip()) for i, l in enumerate(old) if l.strip().startswith("[")]
+    def section(line: int) -> str:
+        cur = ""
+        for ln, h in headers:
+            if ln <= line:
+                cur = h
+        return cur
+    lines = set(fc.removed) | set(fc.added_after) | {a + 1 for a in fc.added_after}
+    if any("pytest" in t for t in fc.added_text + fc.removed_text):
+        return True
+    return any("pytest" in section(ln) for ln in lines if ln >= 1)
+
+
 def analyze_data(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     base = os.path.basename(fc.path)
-    if base in PYTEST_CONFIG:
-        A.broad = True
-        A.notes.append(f"{fc.path}: pytest config")
-        return
+    if base in PYTEST_CONFIG and (fc.path.count("/") == 0 or base in ("conftest.py", "pytest.ini")):
+        if _touches_pytest_section(fc, repo):
+            A.broad = True
+            A.notes.append(f"{fc.path}: pytest config")
+            return
+        A.notes.append(f"{fc.path}: config outside pytest sections")
     hit: set[int] = set()
     for p in fc.paths:
         hit |= M.openers(p)
