@@ -737,11 +737,24 @@ def _merge_reach(runs: list[dict]) -> dict:
             "lines": lines, "unstable": unstable}
 
 
-def build_reach(repo: str, tmpdir: str) -> dict:
-    runs = []
+def start_reach(repo: str, tmpdir: str) -> list:
+    """Start the reach recordings, one process per hash seed, and return them: they run
+    beside the rest of the build (the build has 4 cores and a time limit)."""
+    import subprocess
+
+    procs = []
     for seed in ("1", "777"):
         rp = os.path.join(tmpdir, f"reach-{seed}.json")
-        _run_self("_reach", repo, rp, seed=seed)
+        env = dict(os.environ, PYTHONHASHSEED=seed, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1")
+        procs.append((subprocess.Popen([sys.executable, os.path.abspath(__file__), "_reach", repo, rp], env=env), rp))
+    return procs
+
+
+def finish_reach(procs: list) -> dict:
+    runs = []
+    for proc, rp in procs:
+        if proc.wait() != 0:
+            raise RuntimeError("reach recording failed")
         with open(rp, encoding="utf-8") as fh:
             runs.append(json.load(fh))
     doc = _merge_reach(runs)
@@ -750,6 +763,10 @@ def build_reach(repo: str, tmpdir: str) -> dict:
     print(f"replay reach: {n_lines} line ranges, {n_bad} unstable lines, "
           f"{sum(b - a + 1 for rs in doc['outside'].values() for a, b in rs)} lines outside windows", file=sys.stderr)
     return doc
+
+
+def build_reach(repo: str, tmpdir: str) -> dict:
+    return finish_reach(start_reach(repo, tmpdir))
 
 
 def _ranges(ls: list[int]) -> list[list[int]]:
@@ -791,6 +808,7 @@ def build(repo: str, out_path: str) -> None:
     import tempfile
 
     tmpdir = tempfile.mkdtemp(prefix="replay-build-")
+    reach_procs = start_reach(repo, tmpdir) if hasattr(sys, "monitoring") else None
     runs = []
     for seed in ("1", "2", "777"):
         tmp_path = os.path.join(tmpdir, f"fp-{seed}.json")
@@ -820,7 +838,7 @@ def build(repo: str, out_path: str) -> None:
                     union.setdefault(f, set()).update(ls)
         doc["exec_lines"] = {f: _ranges(sorted(ls)) for f, ls in sorted(union.items())}
         print(f"replay exec lines: {sum(len(v) for v in union.values())} lines in {len(union)} files", file=sys.stderr)
-        doc["reach"] = build_reach(repo, tmpdir)
+        doc["reach"] = finish_reach(reach_procs)
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, separators=(",", ":"))
     import shutil
