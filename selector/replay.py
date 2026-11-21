@@ -489,9 +489,11 @@ def exec_lines_touched(base: dict, changes) -> bool:
 #   (1) every object created during the run and still alive after a collection: its type and
 #       its content two levels deep (atoms by value);
 #   (2) every change the run made to the module-level and class-level state of sqlglot's
-#       modules: containers two levels deep, atoms by value, function defaults and closure
-#       cells, attributes of module-level instances, lru_cache statistics;
-#   (3) the TPC tables: the same row objects in the same order.
+#       modules: containers in full (nested ones too), atoms by value, function defaults and
+#       closure cells, attributes of module-level instances, lru_cache statistics;
+#   (3) the TPC tables: the same row objects in the same order, the same attributes;
+#   (4) interpreter-wide state: recursion limit, environment, decimal context, random state,
+#       and which object every global of every other imported module is bound to.
 # A query that reads a memoised result runs the memoised code itself when it runs alone, so
 # it is among the queries that reach L: caches need no signature. Anything that does not
 # match is "not proven", and the caller does what v6 does.
@@ -504,6 +506,8 @@ _FUNC = type(lambda: 0)
 _LRU = type(_functools.lru_cache(maxsize=None)(lambda: 0))
 _MODULE = type(sys)
 ISO_MAX_SURVIVORS = 200000
+DEEP_MAX_LEN = 2000
+DEEP_LEVELS = 40
 
 
 def cpu_limits(base: dict, tid: str, mode: str | None = None) -> list | None:
@@ -523,26 +527,28 @@ def cpu_limits(base: dict, tid: str, mode: str | None = None) -> list | None:
     return out
 
 
-def _d(v, depth: int) -> str:
+def _d(v, depth: int, deep: int = 0) -> str:
     """Canonical descriptor of a value: atoms by value; containers, functions and instances of
-    sqlglot's classes `depth` levels deep; everything else by type. No ids, no hash order."""
+    sqlglot's classes `depth` levels deep; everything else by type. No ids, no hash order.
+    With `deep`, builtin containers nested below `depth` are still described in full, up to
+    `deep` further levels and DEEP_MAX_LEN entries each (tries, nested mappings)."""
     t = type(v)
     if t in _ATOMS:
         if t is int and not -2147483648 <= v <= 2147483647:
             return "int:big"  # ids and hashes: they differ from process to process
         return f"{t.__name__}:{v!r}"
-    if t is tuple or t is list:
+    if t is tuple or t is list or t is dict or t is set or t is frozenset:
         if depth <= 0:
-            return f"{t.__name__}#{len(v)}"
-        return f"{t.__name__}[" + ",".join([_d(x, depth - 1) for x in v]) + "]"
-    if t is dict:
-        if depth <= 0:
-            return f"dict#{len(v)}"
-        return "dict{" + ",".join(sorted([_d(k, depth - 1) + "=" + _d(x, depth - 1) for k, x in v.items()])) + "}"
-    if t is set or t is frozenset:
-        if depth <= 0:
-            return f"{t.__name__}#{len(v)}"
-        return f"{t.__name__}{{" + ",".join(sorted([_d(x, depth - 1) for x in v])) + "}"
+            if deep <= 0 or len(v) > DEEP_MAX_LEN:
+                return f"{t.__name__}#{len(v)}"
+            deep -= 1
+        else:
+            depth -= 1
+        if t is dict:
+            return "dict{" + ",".join(sorted([_d(k, depth, deep) + "=" + _d(x, depth, deep) for k, x in v.items()])) + "}"
+        if t is tuple or t is list:
+            return f"{t.__name__}[" + ",".join([_d(x, depth, deep) for x in v]) + "]"
+        return f"{t.__name__}{{" + ",".join(sorted([_d(x, depth, deep) for x in v])) + "}"
     if isinstance(v, type):
         return f"class:{v.__module__}.{v.__qualname__}"
     mod = str(getattr(t, "__module__", "?"))
@@ -551,22 +557,22 @@ def _d(v, depth: int) -> str:
         s = f"fn:{v.__module__}.{v.__qualname__}"
         if depth > 0:
             if v.__defaults__:
-                s += "|d=" + _d(v.__defaults__, depth)
+                s += "|d=" + _d(v.__defaults__, depth, deep)
             if v.__kwdefaults__:
-                s += "|k=" + _d(v.__kwdefaults__, depth)
+                s += "|k=" + _d(v.__kwdefaults__, depth, deep)
             if v.__closure__:
                 cells = []
                 for c in v.__closure__:
                     try:
-                        cells.append(_d(c.cell_contents, depth - 1))
+                        cells.append(_d(c.cell_contents, depth - 1, deep))
                     except ValueError:
                         cells.append("empty")
                 s += "|c=" + ",".join(cells)
         return s
     if t is staticmethod or t is classmethod:
-        return f"{t.__name__}:" + _d(v.__func__, depth)
+        return f"{t.__name__}:" + _d(v.__func__, depth, deep)
     if t is property:
-        return "property:" + _d(v.fget, depth)
+        return "property:" + _d(v.fget, depth, deep)
     if t is _LRU:
         try:
             return f"lru:{getattr(v, '__qualname__', '?')}:{tuple(v.cache_info())!r}"
@@ -579,7 +585,10 @@ def _d(v, depth: int) -> str:
     if depth > 0 and (mod.startswith("sqlglot") or mod.startswith("tests")):
         d = getattr(v, "__dict__", None)
         if type(d) is dict:
-            return name + "{" + ",".join(sorted([f"{k}={_d(x, depth - 1)}" for k, x in d.items()])) + "}"
+            rows = name == "sqlglot.executor.table.Table"  # its rows are compared by identity (_tables_fp)
+            return name + "{" + ",".join(sorted([
+                f"{k}=#{len(x)}" if rows and k == "rows" and type(x) is list else f"{k}={_d(x, depth - 1, deep)}"
+                for k, x in d.items()])) + "}"
     return name
 
 
@@ -600,7 +609,7 @@ def _static_parts() -> dict[str, str]:
             while f"{path}#{k}" in out:
                 k += 1
             path = f"{path}#{k}"
-        out[path] = _d(v, 2)
+        out[path] = _d(v, 2, DEEP_LEVELS)
 
     def walk(owner: str, d) -> None:
         for k in sorted(d):
@@ -630,6 +639,59 @@ def _tables_fp(tables) -> tuple:
                  for name, t in tables.items())
 
 
+def _globals_fp() -> dict:
+    """Interpreter-wide state outside sqlglot that a later query could read."""
+    import decimal
+    import random
+
+    return {"recursionlimit": sys.getrecursionlimit(), "environ": dict(os.environ),
+            "decimal": repr(decimal.getcontext()), "random": hash(random.getstate()),
+            "path": tuple(sys.path), "cwd": os.getcwd()}
+
+
+def _globals_delta(g0: dict) -> list[str]:
+    g1 = _globals_fp()
+    out = []
+    for k in sorted(g1):
+        if g1[k] != g0.get(k):
+            if k == "environ":
+                keys = sorted(x for x in set(g1[k]) | set(g0[k]) if g1[k].get(x) != g0[k].get(x))
+                out.append("global:environ=" + ",".join(f"{x}={g1[k].get(x)!r}" for x in keys))
+            elif k in ("recursionlimit", "decimal"):
+                out.append(f"global:{k}={g1[k]}")
+            else:
+                out.append(f"global:{k}=changed")
+    return out
+
+
+def _modules_fp() -> dict:
+    """{module: (names, ids of their values)} for every imported module outside sqlglot and the
+    tests: which global of which other module (standard library, third party, the selector)
+    is bound to which object. Compared inside one family of forks only."""
+    out = {}
+    for name, mod in list(sys.modules.items()):
+        if not _ours(name):
+            d = getattr(mod, "__dict__", None)
+            if type(d) is dict:
+                out[name] = (tuple(d), tuple(map(id, d.values())))
+    return out
+
+
+def _modules_delta(m0: dict) -> list[str]:
+    """Names of the other modules' globals that were bound, rebound or removed, and new modules."""
+    out = []
+    m1 = _modules_fp()
+    for name, (keys, ids) in m1.items():
+        old = m0.get(name)
+        if old is None:
+            out.append(f"module+:{name}")
+        elif old != (keys, ids):
+            a, b = dict(zip(*old)), dict(zip(keys, ids))
+            out.append(f"module:{name}:" + ",".join(sorted(str(k) for k in set(a) | set(b) if a.get(k) != b.get(k))))
+    out += [f"module-:{name}" for name in m0 if name not in m1]
+    return out
+
+
 def _tables_desc(tables) -> list[str]:
     """Every table's attributes but its rows (columns, range, readers and what they hold)."""
     return [f"table:{name}=" + ",".join(sorted([f"{k}={_d(x, 2)}" for k, x in vars(t).items() if k != "rows"]))
@@ -646,7 +708,8 @@ def _sig(surv: str, delta: dict, skip) -> str:
     return m.hexdigest()[:20]
 
 
-def _leftover(static0: dict, tables, tables0, dump: str | None = None):
+def _leftover(static0: dict, tables, tables0, dump: str | None = None, globals0: dict | None = None,
+              modules0: dict | None = None):
     """What this process did since gc.freeze() (see the head of this section): (digest of the
     surviving objects, {changed static path: digest of its new value}), or None."""
     import gc
@@ -673,6 +736,10 @@ def _leftover(static0: dict, tables, tables0, dump: str | None = None):
     del objs
     if tables0 is not None:
         parts += _tables_desc(tables)
+    if globals0 is not None:
+        parts += _globals_delta(globals0)
+    if modules0 is not None:
+        parts += sorted(_modules_delta(modules0))
     delta: dict[str, str] = {}
     full: list[str] = []
     now = _static_parts()
@@ -695,7 +762,8 @@ def _leftover(static0: dict, tables, tables0, dump: str | None = None):
     return m.hexdigest()[:20], delta
 
 
-def _iso_one(tid: str, i: int, b, skip_exec_ok: bool, limits, static0: dict, tables, tables0, skip) -> list:
+def _iso_one(tid: str, i: int, b, skip_exec_ok: bool, limits, static0: dict, tables, tables0, skip,
+             globals0=None, modules0=None) -> list:
     """In a fork of its own: query i alone. [reproduces its baseline, signature, CPU s, notes];
     with skip None (image build) the signature is the raw pair of _leftover."""
     import gc
@@ -718,7 +786,8 @@ def _iso_one(tid: str, i: int, b, skip_exec_ok: bool, limits, static0: dict, tab
     if ok:
         dump = os.environ.get("BR_ISO_DUMP")
         sig = _leftover(static0, tables, tables0,
-                        os.path.join(dump, f"q{i}-{'t' if skip_exec_ok else 'f'}-{os.getppid()}.txt") if dump else None)
+                        os.path.join(dump, f"q{i}-{'t' if skip_exec_ok else 'f'}-{os.getppid()}.txt") if dump else None,
+                        globals0, modules0)
         if sig is not None and skip is not None:
             sig = _sig(sig[0], sig[1], skip)
     return [ok, sig, round(dt, 4), notes]
@@ -759,6 +828,8 @@ def iso_run(base: dict, skip_exec_ok: bool, queries, log=None, record: bool = Fa
             tables = te.TestExecutor.tpcds_tables
             tables0 = _tables_fp(tables)
         static0 = {path: hash(desc) for path, desc in _static_parts().items()}
+        globals0 = _globals_fp()
+        modules0 = _modules_fp()
     except BaseException as exc:  # noqa: BLE001
         if log:
             log(f"iso: set-up raised {type(exc).__name__}")
@@ -773,7 +844,7 @@ def iso_run(base: dict, skip_exec_ok: bool, queries, log=None, record: bool = Fa
             code = 1
             try:
                 os.close(r)
-                res = _iso_one(tid, i, b, skip_exec_ok, limits, static0, tables, tables0, skip)
+                res = _iso_one(tid, i, b, skip_exec_ok, limits, static0, tables, tables0, skip, globals0, modules0)
                 with os.fdopen(w, "w") as fh:
                     json.dump(res, fh)
                 code = 0
