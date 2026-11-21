@@ -88,6 +88,11 @@ def instrument(old_src: str, new_src: str, line_old: int, line_new: int,
     node_n, sn, en = bn
     if type(node_o) is not type(node_n) or not _pure(node_o) or not _pure(node_n):
         return None
+    if (so != sn or len(old_src) - eo != len(new_src) - en) and not isinstance(node_o, ast.BoolOp):
+        # The old and the new expression do not occupy the same place: comparing their values
+        # says nothing about the statement (a + b * c -> a * b * c would compare a + b * c
+        # with a * b). Only an and/or chain regrouped by the edit is still compared soundly.
+        return None
     if not _in_function_body(t_new, node_n):
         return None
     text_o, text_n = old_src[so:eo], new_src[sn:en]
