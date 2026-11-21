@@ -39,6 +39,9 @@ OVERHEAD_S = float(os.environ.get("BR_OVERHEAD", "0.2"))
 # (1.3, a guess) is not used: the board charged v4 about twice what the cost map's machine
 # measures for the same work.
 CPU_SCALE = float(os.environ.get("BR_SCALE", "1.8"))
+# The same for the constants below that were measured by hand on that machine (run overhead,
+# replay costs). Kept apart so that a cost map built on another machine can have its own scale.
+FIXED_SCALE = float(os.environ.get("BR_FIXED_SCALE") or CPU_SCALE)
 CPU_FACTOR = 1.25  # our CPU seconds per recorded test second, for tests the cost map lacks
 MIN_CONSIDER_S = 0.1  # tests cheaper than this are never weighed one by one
 MARGIN_S = 0.1  # expected gains smaller than this are not worth the bet
@@ -281,9 +284,9 @@ def plan(verifiable: set[int], fixed_keep: set[int], vcost: dict[int, float], co
             return None
         cpu = setup_s + sum(vcost[n] for n in verify)
         if verify - replays:
-            cpu += OVERHEAD_S * costs.scale
+            cpu += OVERHEAD_S * FIXED_SCALE
         if verify & replays:
-            cpu += REPLAY_OVERHEAD_S * costs.scale
+            cpu += REPLAY_OVERHEAD_S * FIXED_SCALE
         weight = sum(dms[n] for n in verify) or 1
         blend = sum(g(n) * dms[n] for n in verify) / weight
         est = cpu + (keep_ms + (1.0 - blend) * (static_ms - keep_ms)) / 1000
@@ -382,7 +385,7 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
             rc = REPLAY_COST.get(id_of[n])
             if rc is not None and id_of[n] in base.get("tests", {}) and replay_valid(A, M, n):
                 replays.add(n)
-                vcost[n] = costs.scale * (rc[0] if skip_exec_ok else rc[1])
+                vcost[n] = FIXED_SCALE * (rc[0] if skip_exec_ok else rc[1])
     for n in cands:
         if n not in vcost:
             vcost[n] = costs.run(n)
@@ -396,7 +399,7 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
                                       probed=probed is not None, code_only=code_only)
     if not verify_set:
         return set(cands), why
-    worst = cpu + (REPLAY_FULL_S * costs.scale if replays & verify_set else 0.0)
+    worst = cpu + (REPLAY_FULL_S * FIXED_SCALE if replays & verify_set else 0.0)
     if 1.5 * worst + 1.0 > time_left:
         return set(cands), "out of time budget: static"
     rep = sorted(verify_set & replays)
@@ -414,7 +417,7 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
             # are exact). Other unverified huge tests are dropped only on broad evidence;
             # with few tests behind the probe, a replayable one is replayed in full instead.
             broad = len(run) >= MIN_PROBE_TESTS
-            now = [n for n in rep if vcost[n] <= REPLAY_CHEAP_S * costs.scale or not broad]
+            now = [n for n in rep if vcost[n] <= REPLAY_CHEAP_S * FIXED_SCALE or not broad]
             differ = run_replay(A, now, id_of, cid, base, skip_exec_ok, sum(vcost[n] for n in now))
             rest = (keep | set(rep)) - set(now)
             # (never a reader of a changed fixture: the probe says nothing about data)
