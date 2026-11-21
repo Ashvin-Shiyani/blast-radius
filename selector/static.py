@@ -108,6 +108,8 @@ class Analysis:
     # True when candidates were added by anything other than a judged line of an existing
     # python file (new/deleted/renamed/non-compiling modules, data files)
     opaque: bool = False
+    # the same, for python files only (a changed data file does not set it)
+    code_opaque: bool = False
     data_cands: set[int] = field(default_factory=set)  # readers of changed data files
 
 
@@ -634,7 +636,10 @@ def analyze_patch(text: str, repo: str, M: Map) -> Analysis:
             A.notes.append(f"{fc.path}: binary change")
             continue
         if fc.path.endswith(".py") or (fc.old_path or "").endswith(".py"):
+            before, A.opaque = A.opaque, False
             analyze_python(fc, repo, M, A)
+            A.code_opaque = A.code_opaque or A.opaque
+            A.opaque = A.opaque or before
         else:
             analyze_data(fc, repo, M, A)
     return A

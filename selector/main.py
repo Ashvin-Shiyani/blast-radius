@@ -32,7 +32,13 @@ WORK = os.environ.get("BR_WORK", "/tmp/br")
 DYNAMIC = os.environ.get("BR_DYNAMIC", "1") == "1"
 
 HUGE_S = 3.0  # a clean probe drops only unverified tests longer than this; shorter ones stay
-OVERHEAD_S = 0.35  # fork + sqlglot import + collection, per verification run (cost map machine)
+# fork + sqlglot import + collection, per verification run, on the cost map's machine
+# (measured: 0.09-0.15 s in the child for one cheap test, plus the overlay in the parent)
+OVERHEAD_S = float(os.environ.get("BR_OVERHEAD", "0.2"))
+# Scorer CPU seconds per CPU second on the cost map's machine. The cost map's own "scale"
+# (1.3, a guess) is not used: the board charged v4 about twice what the cost map's machine
+# measures for the same work.
+CPU_SCALE = float(os.environ.get("BR_SCALE", "1.8"))
 CPU_FACTOR = 1.25  # our CPU seconds per recorded test second, for tests the cost map lacks
 MIN_CONSIDER_S = 0.1  # tests cheaper than this are never weighed one by one
 MARGIN_S = 0.1  # expected gains smaller than this are not worth the bet
@@ -170,7 +176,7 @@ class Costs:
         try:
             with open(path, encoding="utf-8") as fh:
                 d = json.load(fh)
-            self.scale = float(d.get("scale", 1.0))
+            self.scale = CPU_SCALE
             num = {t["id"]: t["number"] for t in tests}
             self.sec = {num[i]: float(v) for i, v in d["tests"].items() if i in num}
             self.setup = {c: float(v) for c, v in d.get("class_setup", {}).items()}
@@ -206,15 +212,25 @@ def replay_valid(A, M, n: int) -> bool:
     return True
 
 
-def gain_for(n: int) -> float:
-    """Share of the possible saving that verifying n candidates realizes on average: the
-    fewer tests reach a change, the likelier they are the ones that fail (measured on our
-    own labelled mutants: 0.3-0.5 for a handful of candidates, about 0.65 beyond ten)."""
-    return 0.35 if n <= 1 else 0.45 if n <= 10 else 0.65
+GAIN_CODE_ONE = float(os.environ.get("BR_GAIN_CODE_ONE", "0.35"))
+GAIN_CODE = float(os.environ.get("BR_GAIN_CODE", "0.1"))
+GAIN_DECL = float(os.environ.get("BR_GAIN_DECL", "0.6"))
+
+
+def gain_for(n: int, code_only: bool = False) -> float:
+    """Share of the possible saving that verifying n candidates realizes on average,
+    measured on our own labelled mutants. It depends on the kind of change far more than
+    on the number of candidates: tests that execute an edited function body nearly always
+    fail (share 0.1-0.2 of the selection's cost is recovered), while tests that merely load
+    a class whose attribute or declaration changed mostly pass (0.6 and more). A single
+    candidate of a body edit passes more often than several do (0.2-0.45)."""
+    if code_only:
+        return GAIN_CODE_ONE if n <= 1 else GAIN_CODE
+    return GAIN_DECL
 
 
 GAIN_REPLAY = 0.7  # a replayed TPC test is unchanged about seven times in ten
-GAIN_VISIBLE = 0.35  # ... and once a probe has seen the change take effect, failures are likely
+GAIN_VISIBLE = float(os.environ.get("BR_GAIN_VISIBLE", "0.35"))  # ... and once a probe has seen the change take effect, failures are likely
 GAIN_PROBED = 0.9  # a probed run only runs to its end while the change stays invisible
 MIN_PROBE_TESTS = 20  # a clean probe speaks for unverified tests only after this many ran
 BIG_TRIES = 12
@@ -225,7 +241,7 @@ PROBE_RUN_SHARE = 0.5  # a probed run may cost up to this share of what selectin
 
 def plan(verifiable: set[int], fixed_keep: set[int], vcost: dict[int, float], costs: Costs,
          replays: set[int], dms: dict[int, int], gain: float | None = None,
-         probed: bool = False) -> tuple[set[int], set[int], float, str]:
+         probed: bool = False, code_only: bool = False) -> tuple[set[int], set[int], float, str]:
     """Split `verifiable` into tests to verify now and tests to simply select.
 
     Verifying a test costs vcost CPU seconds and removes it from the selection if it passes.
@@ -237,7 +253,7 @@ def plan(verifiable: set[int], fixed_keep: set[int], vcost: dict[int, float], co
     everything = sorted(verifiable | fixed_keep)
     static_ms = pack(everything, dms)[0]
     if gain is None:
-        gain = GAIN_PROBED if probed else gain_for(len(verifiable - replays))
+        gain = GAIN_PROBED if probed else gain_for(len(verifiable - replays), code_only)
 
     def g(n: int) -> float:
         return GAIN_REPLAY if n in replays else gain
@@ -359,7 +375,9 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
     if base is not None:
         import replay
 
-        skip_exec_ok = not A.opaque and not replay.exec_lines_touched(base, A.changes)
+        # (a changed fixture does not stand in the way: replay_valid admits a test only if
+        # it never opens any changed data file)
+        skip_exec_ok = not A.code_opaque and not replay.exec_lines_touched(base, A.changes)
         for n in cands:
             rc = REPLAY_COST.get(id_of[n])
             if rc is not None and id_of[n] in base.get("tests", {}) and replay_valid(A, M, n):
@@ -371,8 +389,11 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
     static_ms = pack(sorted(cands), dms)[0]
     # readers of a changed fixture nearly always fail: selected without being run
     fixed = set(cands) & A.data_cands
+    kinds = {k for _, k, _, _ in A.changes}
+    # every code change is an edit inside a function body or a lambda of an existing module
+    code_only = bool(kinds) and kinds <= {"body", "lambda"} and not A.code_opaque
     verify_set, keep, cpu, why = plan(set(cands) - fixed, fixed, vcost, costs, replays, dms,
-                                      probed=probed is not None)
+                                      probed=probed is not None, code_only=code_only)
     if not verify_set:
         return set(cands), why
     worst = cpu + (REPLAY_FULL_S * costs.scale if replays & verify_set else 0.0)
@@ -413,7 +434,8 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
     if not run:
         return keep | differ, why
     if differ:
-        verify2, keep2, _, why2 = plan(set(run), keep | differ, vcost, costs, set(), dms)
+        verify2, keep2, _, why2 = plan(set(run), keep | differ, vcost, costs, set(), dms,
+                                       code_only=code_only)
         if not verify2:
             return keep2, why + " | after replay: " + why2
         failing, _, _ = do_run(sorted(verify2), probed, False)
@@ -469,6 +491,15 @@ def main() -> int:
     signal.signal(signal.SIGALRM, _alarm)
     hard_budget = WALL_PER_COMMIT_S * len(commits) * 0.8  # the run's limit, with margin
     lines = []
+    import resource as _res
+
+    def _cpu() -> float:
+        a = _res.getrusage(_res.RUSAGE_SELF)
+        b = _res.getrusage(_res.RUSAGE_CHILDREN)
+        return a.ru_utime + a.ru_stime + b.ru_utime + b.ru_stime
+
+    c_prev = _cpu()
+    log(f"start: cpu {c_prev:.2f}s")
     for cid in commits:
         select = None
         remaining = hard_budget - (time.monotonic() - t0)
@@ -519,8 +550,11 @@ def main() -> int:
                 signal.setitimer(signal.ITIMER_REAL, 0)
         if select is None:
             select = set(all_tests)
-        _, workers = pack(sorted(n for n in select if n in dms), dms)
+        cost_ms, workers = pack(sorted(n for n in select if n in dms), dms)
         lines.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
+        c_now = _cpu()
+        log(f"{cid}: cost {cost_ms / 1000:.3f}s cpu {c_now - c_prev:.2f}s")
+        c_prev = c_now
     sys.stdout.write("".join(line + "\n" for line in lines))
     sys.stdout.flush()
     log(f"done: {len(commits)} commits in {time.monotonic() - t0:.2f}s wall")
