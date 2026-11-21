@@ -84,6 +84,17 @@ ISO_MAX_SHARE = float(os.environ.get("BR_ISO_SHARE", "0.6"))
 P_ISO = float(os.environ.get("BR_P_ISO", "0.5"))  # share of isolated replays that prove "unchanged"
 ISO_HEUR_MAX_S = float(os.environ.get("BR_ISO_HEUR_MAX", "1.5"))  # dearest proof asked in place of the clean-probe heuristic
 
+# v8. The clean-probe heuristic (decide): after MIN_PROBE_TESTS probed tests ran the changed
+# expression with its old and new value never differing, unverified tests longer than HUGE_S
+# are dropped without proof. BR_HEUR=0 turns it off: then nothing is ever dropped unproven
+# (replayable TPC tests are replayed in full, the others stay selected). While it is on, a
+# replayable TPC test is dropped only after a sample of the plain replay on the real tables
+# reproduced the baseline: the first HEUR_BOX_N executed TPC-DS queries (of those that reach
+# the changed lines, when the reach map can tell; about 1.9 s on the cost map's machine when
+# all ten run in full), and any replay that differs keeps every huge test.
+HEUR = os.environ.get("BR_HEUR", "1") == "1"
+HEUR_BOX_N = int(os.environ.get("BR_HEUR_BOX", "10"))
+
 MAP_DIR = os.path.dirname(MAP)
 COST = os.environ.get("BR_COST", os.path.join(MAP_DIR, "cost.json"))
 REPLAY = os.environ.get("BR_REPLAY", os.path.join(MAP_DIR, "replay.json"))
@@ -507,6 +518,62 @@ def iso_replay(A, cid: str, base: dict, skip_exec_ok: bool, iso) -> str:
         shutil.rmtree(overlay, ignore_errors=True)
 
 
+def box_replay(A, nums: list[int], id_of, cid: str, base: dict, skip_exec_ok: bool) -> bool:
+    """v8. A sample of the plain replay of the given TPC tests on the patched tree, asked
+    before the clean-probe heuristic drops them unproven. test_execute_tpcds: the first
+    HEUR_BOX_N executed queries in the test's order, taken from the queries that reach the
+    changed lines when the reach map vouches for those lines (with at most HEUR_BOX_N of
+    them, that is every query that can tell). The two TPC-H tests: every query. True only when
+    every replayed query reproduces its baseline; False when one differs or raises, runs over
+    its limit, or the replay cannot run."""
+    import warm
+    from runner import build_overlay
+
+    overlay = os.path.join(WORK, "ovb")
+    try:
+        import replay
+        import resource
+
+        ids = [id_of[n] for n in nums]
+        only: dict[str, list[int]] = {}
+        for tid in ids:
+            recs = base.get("tests", {}).get(tid)
+            if recs is None:
+                return False
+            if tid != replay.T_TPCDS:
+                only[tid] = list(range(len(recs)))
+                continue
+            pool = [i for i, r in enumerate(recs) if r is not None]  # the executed queries
+            reached: set[int] | None = set()
+            if A.code_opaque or len(A.files) != 1 or not A.changes:
+                reached = None
+            else:
+                for path, kind, lo, hi in A.changes:
+                    got = replay.reach_of(base, path, lo, hi, [tid]) if kind in ("body", "lambda") else None
+                    if got is None:
+                        reached = None
+                        break
+                    reached.update(got[tid])
+            if reached is not None and any(i in reached for i in pool):
+                pool = [i for i in pool if i in reached]
+            only[tid] = pool[:max(1, HEUR_BOX_N)]
+        build_overlay(REPO, overlay, patched_files(A, REPO))
+        r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        res, notes = warm.replay_check(overlay, ids, base, skip_exec_ok, WORK, 20 + 4 * REPLAY_FULL_S,
+                                       only=only, timed=ISO)
+        r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        ok = all(res.get(t) is True for t in ids)
+        log(f"{cid}: sample replay cpu {r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime:.2f}s "
+            f"({'trees' if skip_exec_ok else 'full'}, {'+'.join(str(len(only[t])) for t in ids)} queries): "
+            f"{'same' if ok else 'differs'}" + (f" | {'; '.join(notes)[:120]}" if notes else ""))
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        log(f"{cid}: sample replay failed to run ({exc!r}): keeping")
+        return False
+    finally:
+        shutil.rmtree(overlay, ignore_errors=True)
+
+
 def run_replay(A, nums: list[int], id_of, cid: str, base: dict, skip_exec_ok: bool, est_s: float,
                lim=None, iso=None) -> set[int]:
     """Replay the given tests on the patched tree; returns those NOT proven unchanged."""
@@ -660,25 +727,33 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
             # the changed expression ran and never differed. Cheap replays still run (they
             # are exact). Other unverified huge tests are dropped only on broad evidence;
             # with few tests behind the probe, a replayable one is replayed in full instead.
-            broad = len(run) >= MIN_PROBE_TESTS
+            broad = HEUR and len(run) >= MIN_PROBE_TESTS
             now = [n for n in rep if vcost6.get(n, vcost[n]) <= REPLAY_CHEAP_S * FIXED_SCALE or not broad]
             differ = run_replay(A, now, id_of, cid, base, skip_exec_ok, sum(vcost[n] for n in now), lim, iso)
             rest = (keep | set(rep)) - set(now)
             # (never a reader of a changed fixture: the probe says nothing about data)
             huge = {n for n in rest - fixed if dsec[n] > HUGE_S} if broad else set()
             note = ""
-            if huge and ISO:
+            proven: set[int] = set()
+            if huge and differ:
+                # v8: an exact replay has just shown the change at work: nothing is dropped unproven
+                huge, note = set(), " (a replay differed: every huge test kept)"
+            if huge and ISO and iso is not None and n_ds in huge and iso[1] <= ISO_HEUR_MAX_S:
                 # v7: the heuristic is about to drop these unverified. Where a cheap isolated
                 # replay can speak for test_execute_tpcds, it is asked: a proof replaces the
-                # heuristic, and a query that no longer reproduces its baseline keeps the test.
-                alone = len(huge)
-                if iso is not None and n_ds in huge and iso[1] <= ISO_HEUR_MAX_S:
-                    verdict = iso_replay(A, cid, base, skip_exec_ok, iso)
-                    if verdict == "diff":
-                        huge.discard(n_ds)
-                    if verdict != "unknown":
-                        alone -= 1
-                note = f" ({alone} on the heuristic alone)"
+                # heuristic. v8: a query that no longer reproduces its baseline keeps every
+                # huge test, not that one alone.
+                verdict = iso_replay(A, cid, base, skip_exec_ok, iso)
+                if verdict == "diff":
+                    huge, note = set(), " (the isolated replay differed: every huge test kept)"
+                elif verdict == "same":
+                    proven.add(n_ds)
+            box = sorted(n for n in huge & replays if n not in proven)
+            if box and not box_replay(A, box, id_of, cid, base, skip_exec_ok):
+                # v8: a sample of the plain replay differs, raises or runs over its limit
+                huge, note = set(), " (the sample replay differed: every huge test kept)"
+            if huge:
+                note = f" ({len(huge - proven)} on the heuristic alone)"
             return (rest - huge) | differ, why + f" | probe: never visible -> {len(huge)} huge dropped" + note
         if aborted:
             # nothing is known about the tests yet, except that failures are now likely

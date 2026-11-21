@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import zlib
 from dataclasses import dataclass, field
 
@@ -169,6 +170,204 @@ def _replacement_pairs(fc: FileChange) -> dict[int, str]:
 def _is_code_line(text: str) -> bool:
     t = text.strip()
     return bool(t) and not t.startswith("#")
+
+
+QUIET_LIMIT = 12  # more quiet added lines than this are not examined one by one
+
+
+def _without(lines: list[str], drop: set[int]) -> str:
+    return "\n".join(l for i, l in enumerate(lines) if i not in drop)
+
+
+def _live_quiet_lines(new_src: str, new_lines: list[str], new_tok, origin: list) -> set[int]:
+    """v8. Indices (0-based) of added lines that LOOK like a comment or a blank line but are
+    part of the program: a line inside a multi-line string, after a backslash continuation,
+    or anywhere else it changes what the parser reads.
+
+    Decided on the program, not on the look of the line: a set of such lines is harmless only
+    if the patched file without them has the very same token stream (comments and
+    non-logical newlines aside), hence the same syntax tree. Lines that cannot be taken out
+    are returned, unless all they change is the text of docstrings and of bare string
+    statements (see _strip_bare_strings: without those the two syntax trees are identical)."""
+    quiet = [i for i, o in enumerate(origin) if o is None and not _is_code_line(new_lines[i])]
+    if not quiet:
+        return set()
+    if new_tok is None:
+        return set(quiet)
+
+    def same_without(drop: set[int]) -> bool:
+        tok = significant_tokens(_without(new_lines, drop))
+        return tok is not None and tok == new_tok
+
+    if same_without(set(quiet)):
+        return set()
+    dropped: set[int] = set()
+    live: set[int] = set()
+    if len(quiet) > QUIET_LIMIT:
+        live = set(quiet)
+    else:
+        for i in quiet:
+            if same_without(dropped | {i}):
+                dropped.add(i)
+            else:
+                live.add(i)
+    try:
+        a = ast.dump(_strip_bare_strings(ast.parse(new_src)))
+        b = ast.dump(_strip_bare_strings(ast.parse(_without(new_lines, dropped | live))))
+        if a == b:
+            return set()  # docstring / bare string text only
+    except (SyntaxError, ValueError):
+        pass
+    return live
+
+
+def _strip_bare_strings(tree: ast.AST) -> ast.AST:
+    """Remove every statement that is nothing but a string constant: a docstring (the
+    docstring rule: no test reads docstring text) and a bare string anywhere else in a body
+    (an "attribute docstring", a string used as a comment: the compiler emits no code for it)."""
+    for node in ast.walk(tree):
+        for fld in ("body", "orelse", "finalbody"):
+            body = getattr(node, fld, None)
+            if isinstance(body, list) and body and isinstance(body[0], ast.stmt):
+                kept = [st for st in body if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)
+                                                  and isinstance(st.value.value, str))]
+                if len(kept) != len(body):
+                    setattr(node, fld, kept or [ast.Pass()])
+    return tree
+
+
+def _same_but_stmts(old_src: str, new_src: str, old_nodes: list, new_nodes: list) -> bool:
+    """True if the two files have the same syntax tree once the given statements (the old
+    file's in the old tree, the new file's in the new tree) are emptied: every difference
+    between the files lies inside those statements."""
+
+    def key(n) -> tuple:
+        return (type(n).__name__, n.lineno, n.col_offset, n.end_lineno, n.end_col_offset)
+
+    try:
+        dumps = []
+        for src, nodes in ((old_src, old_nodes), (new_src, new_nodes)):
+            want = {key(n) for n in nodes}
+            tree = ast.parse(src)
+            found = 0
+            for node in ast.walk(tree):
+                if isinstance(node, ast.stmt) and key(node) in want:
+                    for f in node._fields:
+                        setattr(node, f, [] if isinstance(getattr(node, f, None), list) else None)
+                    found += 1
+            if found != len(want):
+                return False
+            dumps.append(ast.dump(tree))
+        return dumps[0] == dumps[1]
+    except (SyntaxError, ValueError):
+        return False
+
+
+def _same_but_bare_strings(old_src: str, new_src: str) -> bool:
+    try:
+        return ast.dump(_strip_bare_strings(ast.parse(old_src))) == ast.dump(_strip_bare_strings(ast.parse(new_src)))
+    except (SyntaxError, ValueError):
+        return False
+
+
+def _unhosted_new_lines(fc: FileChange, live: set[int]) -> set[int]:
+    """v8. New-file line numbers of added lines that no removed CODE line stands for. A
+    removed line that looks like a comment or a blank line hosts nothing (judged in the
+    original file it selects nobody when it lies between statements), so in each block the
+    added code lines (and live quiet lines) beyond the number of removed code lines are
+    insertions and are judged as such."""
+    out: set[int] = set()
+    for h in fc.hunks:
+        new_no = h.new_start
+        lines = h.lines
+        i = 0
+        while i < len(lines):
+            if lines[i].startswith("-") or lines[i].startswith("+"):
+                j = i
+                while j < len(lines) and lines[j].startswith("-"):
+                    j += 1
+                k = j
+                while k < len(lines) and lines[k].startswith("+"):
+                    k += 1
+                hosts = sum(1 for t in range(i, j) if _is_code_line(lines[t][1:]))
+                rank = 0
+                for t in range(j, k):
+                    nln = new_no + (t - j)
+                    if _is_code_line(lines[t][1:]) or (nln - 1) in live:
+                        if rank >= hosts:
+                            out.add(nln)
+                        rank += 1
+                new_no += k - j
+                i = k
+            else:
+                new_no += 1
+                i += 1
+    return out
+
+
+def _same_tree_as_bytes(old_src: str, new_src: str) -> bool:
+    """The two files parse to the same syntax tree when read as the interpreter reads them
+    (from bytes, honouring a coding cookie)."""
+    try:
+        a = ast.dump(ast.parse(old_src.encode("utf-8", "surrogateescape")))
+        b = ast.dump(ast.parse(new_src.encode("utf-8", "surrogateescape")))
+    except (SyntaxError, ValueError, LookupError, UnicodeDecodeError):
+        return False
+    return a == b
+
+
+_MENTIONS: dict[str, bool] = {}
+_SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache", "build", "dist"}
+
+
+def _tree_mentions(repo: str, word: str) -> bool:
+    """True if `word` occurs as a whole word in any python file of the pinned tree: an import
+    (also inside try/except), an importlib call, a lazily looked up attribute or dialect name."""
+    got = _MENTIONS.get(word)
+    if got is None:
+        pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(word) + r"(?![A-Za-z0-9_])")
+        got = False
+        for root, dirs, files in os.walk(repo):
+            dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS and not d.startswith("."))
+            for name in sorted(files):
+                if not name.endswith(".py"):
+                    continue
+                try:
+                    with open(os.path.join(root, name), encoding="utf-8", errors="replace") as fh:
+                        if pat.search(fh.read()):
+                            got = True
+                            break
+                except OSError:
+                    got = True  # unreadable: assume it does
+                    break
+            if got:
+                break
+        _MENTIONS[word] = got
+    return got
+
+
+def _new_module_reach(p: str, repo: str) -> str | None:
+    """v8. Why a NEW python file can change what every test imports, or None: it shadows an
+    existing module or package, it turns an existing directory into a package, or its name is
+    one the pinned tree already asks for (an optional import in try/except, importlib, a lazy
+    attribute or dialect lookup, a third-party or stdlib module of that name)."""
+    d, b = os.path.split(p)
+    if b == "__init__.py":
+        if os.path.isfile(os.path.join(repo, d + ".py")):
+            return f"shadows module {d}.py"
+        if os.path.isdir(os.path.join(repo, d)):
+            return f"turns the existing directory {d or '.'} into a package"
+        name = os.path.basename(d)
+    else:
+        stem = p[:-3] if p.endswith(".py") else p
+        if os.path.isdir(os.path.join(repo, stem)):
+            return f"stands beside the directory {stem}"
+        name = os.path.basename(stem)
+    if name in ("sitecustomize", "usercustomize"):
+        return "is imported at interpreter start"
+    if name and _tree_mentions(repo, name):
+        return f"has a name the pinned tree mentions ({name}): optional or dynamic import, or shadowing"
+    return None
 
 
 _REFS = None
@@ -465,6 +664,11 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
         A.notes.append(f"{fc.path}: pytest config")
         return
     if fc.is_new or not os.path.isfile(old_file):
+        why_all = _new_module_reach(fc.new_path or fc.path, repo)
+        if why_all is not None:
+            A.broad = True
+            A.notes.append(f"{fc.path}: new python file {why_all}")
+            return
         hit: set[int] = set()
         R = _refs()
         if R is not None:
@@ -502,6 +706,13 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
             A.notes.append(f"{fc.path}: file no longer decodes/compiles -> {len(users)} users")
             return
     if old_tok is not None and old_tok == new_tok:
+        if head_changed and not _same_tree_as_bytes(old_src, new_src):
+            # v8: a coding cookie that changes how the file's bytes are read
+            A.cands |= users
+            A.opaque = True
+            A.changes.append((path, "import", 0, 0))
+            A.notes.append(f"{fc.path}: same tokens, another tree when read from bytes -> all {len(users)} users")
+            return
         A.notes.append(f"{fc.path}: comments/blank lines only")
         return
     if docstring_only(old_tok, new_tok, old_src, new_src):
@@ -524,6 +735,8 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     sc = FileScopes(old_src)
     old_lines = old_src.split("\n")
     pairs = _replacement_pairs(fc)
+    n_changes0 = len(A.changes)
+    stmt_starts = {st[0] for st in sc.stmts}
     # 1. modified and removed lines, judged in the original file
     for ln in sorted(set(fc.removed)):
         span = _changed_span(old_lines[ln - 1], pairs[ln]) if ln in pairs else None
@@ -533,13 +746,79 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
         A.cands |= hit
         A.notes.append(f"{path}:{ln} {kind} -> {len(hit)}")
         A.changes.append((path, kind.split("/")[0], *_runtime_range(path, ln, span, sc, kind)))
+        if kind == "body" and ln in pairs and ln in stmt_starts:
+            # v8: a statement of a function body whose line now starts further left has left
+            # its block (an `if`, a loop, a nested def): it also runs for tests that never ran
+            # the old line. Everyone who runs the outermost enclosing def; if it left that
+            # too (class body or module level), everyone who loads the file.
+            old_text, new_text = old_lines[ln - 1], pairs[ln]
+            ind_old = len(old_text) - len(old_text.lstrip())
+            ind_new = len(new_text) - len(new_text.lstrip())
+            outer = None
+            for fn in sc.funcs:
+                if fn[0] <= ln <= fn[1] and (outer is None or fn[1] - fn[0] > outer[1] - outer[0]):
+                    outer = fn
+            if ind_new < ind_old and _is_code_line(new_text) and outer is not None:
+                head = old_lines[outer[0] - 1]
+                if ind_new <= len(head) - len(head.lstrip()):
+                    more = set(users)
+                    A.changes.append((path, "import", ln, ln))
+                else:
+                    more = M.rt_lines(path, outer[0], outer[1])
+                    A.changes.append((path, "body", outer[2], outer[1]))
+                A.cands |= more
+                A.notes.append(f"{path}:{ln} moved left out of its block -> {len(more)}")
     # 2. inserted lines, judged in the patched file and mapped back to the original
     new_lines = new_src.split("\n")
     surplus = _insert_new_lines(fc)
+    # v8: whether an added line is "only a comment or a blank line" is a fact about the program
+    # (see _live_quiet_lines), and a removed comment or blank line stands for no added code
+    live = _live_quiet_lines(new_src, new_lines, new_tok, origin)
+    unhosted = _unhosted_new_lines(fc, set())
     inserted = [
         i for i, o in enumerate(origin)
-        if o is None and (i + 1) in surplus and _is_code_line(new_lines[i])
+        if o is None and _is_code_line(new_lines[i]) and ((i + 1) in surplus or (i + 1) in unhosted)
     ]
+    if live:
+        # Each live quiet line belongs to the statement that contains it: the one its nearest
+        # original lines above and below are both part of (the string, or the continued line,
+        # runs from one to the other). Proven on the syntax trees: with those statements
+        # emptied in both files, the files are identical. Then the statement is judged by the
+        # rule for a changed line of it (import time at module or class level, executors in a
+        # function body). Anything else: nothing is known, every user of the file.
+        host: dict[int, tuple] = {}
+        try:
+            lsc = FileScopes(new_src)
+            for i in sorted(live):
+                jp = next((j for j in range(i - 1, -1, -1) if origin[j] is not None), None)
+                jn = next((j for j in range(i + 1, len(origin)) if origin[j] is not None), None)
+                so = sc.stmt_node_of(origin[jp]) if jp is not None and jn is not None else None
+                sn = lsc.stmt_node_of(jp + 1) if so is not None else None
+                if so is None or sn is None or so is not sc.stmt_node_of(origin[jn]) or sn is not lsc.stmt_node_of(jn + 1):
+                    host = {}
+                    break
+                host[origin[jp]] = (so, sn)
+            if host and not _same_but_stmts(old_src, new_src, [v[0] for v in host.values()],
+                                            [v[1] for v in host.values()]):
+                host = {}
+        except (SyntaxError, ValueError):
+            host = {}
+        if host:
+            done: set[int] = set()
+            for o in sorted(host):
+                if id(host[o][0]) in done:
+                    continue
+                done.add(id(host[o][0]))
+                hit, kind = _rule_for_old_line(path, o, None, sc, M)
+                A.cands |= hit
+                A.notes.append(f"{path}:{o} {kind} (line inside a string or continuation) -> {len(hit)}")
+                A.changes.append((path, kind.split("/")[0], *_runtime_range(path, o, None, sc, kind)))
+        else:
+            A.cands |= users
+            A.opaque = True
+            A.changes.append((path, "import", 0, 0))
+            A.notes.append(f"{path}: a line that looks like a comment changes the tree beyond one statement"
+                           f" -> all {len(users)} users")
     if inserted:
         nsc = FileScopes(new_src)
         for i in inserted:
@@ -593,6 +872,17 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
                 A.cands |= hit
                 A.notes.append(f"{path}:+{nln} import-time insert -> {len(hit)}")
                 A.changes.append((path, "import", 0, 0))
+    if len(A.changes) == n_changes0:
+        if _same_but_bare_strings(old_src, new_src):
+            # v8: proven on the syntax trees: only docstrings / bare string statements differ
+            A.notes.append(f"{fc.path}: comments/blank lines only (bare strings)")
+            return
+        # v8: the syntax trees differ and no rule above judged anything: nothing is known
+        # about where the difference acts
+        A.cands |= users
+        A.opaque = True
+        A.changes.append((path, "import", 0, 0))
+        A.notes.append(f"{path}: a difference no rule judged -> all {len(users)} users")
 
 
 def _touches_pytest_section(fc: FileChange, repo: str) -> bool:
@@ -637,7 +927,9 @@ def _config_parses(fc: FileChange, repo: str) -> bool:
 
 def analyze_data(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     base = os.path.basename(fc.path)
-    if base in PYTEST_CONFIG and (fc.path.count("/") == 0 or base in ("conftest.py", "pytest.ini")):
+    # (v8: also below tests/, where pytest looks first when it is given test ids)
+    if base in PYTEST_CONFIG and (fc.path.count("/") == 0 or fc.path.startswith("tests/")
+                                  or base in ("conftest.py", "pytest.ini")):
         if _touches_pytest_section(fc, repo) or not _config_parses(fc, repo):
             A.broad = True
             A.notes.append(f"{fc.path}: pytest config (or no longer parses)")

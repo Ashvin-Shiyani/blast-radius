@@ -449,7 +449,7 @@ def check(test_ids: list[str], base: dict, skip_exec_ok: bool, log=None, only: d
                 out[tid] = False
                 continue
             try:
-                # (`only` is used by the audit of reach-limited replays alone, never for a verdict)
+                # (`only`: the audit of reach-limited replays, and the v8 sample asked before the clean-probe heuristic)
                 out[tid] = run_one(tid, b, skip_exec_ok, log,
                                    only=None if only is None else set(only.get(tid, ())),
                                    limits=cpu_limits(base, tid) if timed else None) is True
