@@ -17,5 +17,5 @@ RUN python /app/selector/refindex.py /app/sqlglot /app/map/refs.json
 RUN SKIP_INTEGRATION=0 python /app/selector/replay.py build /app/sqlglot /app/map/replay.json
 RUN python -m compileall -q /app/selector && chmod -R a+rX /app
 ENV BR_DATA=/data BR_REPO=/app/sqlglot BR_MAP=/app/map/blast.map BR_REFS=/app/map/refs.json \
-    BR_WORK=/tmp/br PYTHONDONTWRITEBYTECODE=1
+    BR_WORK=/tmp/br PYTHONDONTWRITEBYTECODE=1 BR_DYNAMIC=0
 CMD ["python", "/app/selector/main.py"]
