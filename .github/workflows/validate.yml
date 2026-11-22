@@ -20,6 +20,11 @@ jobs:
           docker run --rm --network none -v "$PWD/tests:/app/tests:ro" \
             -v /tmp/kit/sample/tests.json:/data/tests.json:ro -e BR_TESTS=/data/tests.json \
             --entrypoint python blast-entry -B /app/tests/test_cmp_rule.py
+      - name: Unit tests of the table-entry rule under the image's Python
+        run: |
+          docker run --rm --network none -v "$PWD/tests:/app/tests:ro" \
+            -v /tmp/kit/sample/tests.json:/data/tests.json:ro -e BR_TESTS=/data/tests.json \
+            --entrypoint python blast-entry -B /app/tests/test_tab_rule.py
       - name: Run 3x with the scorer's flags and score
         run: |
           set -e

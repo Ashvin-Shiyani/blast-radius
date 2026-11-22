@@ -28,6 +28,7 @@ class Map:
         with open(path, "rb") as fh:
             doc = json.loads(zlib.decompress(fh.read()))
         num = {t["id"]: t["number"] for t in tests}
+        self.num = num
         self.to_num = [num.get(i) for i in doc["ids"]]
         self._sets = doc["sets"]
         self._cache: dict[int, frozenset[int]] = {}
@@ -1402,6 +1403,167 @@ def _cmp_rule(path: str, fc: FileChange, repo: str, old_src: str, new_src: str, 
         return f"cmp: rule failed ({exc!r})"
 
 
+# ---- v11: readers of one entry of a class-level table ------------------------------------
+TAB = os.environ.get("BR_TAB", "1") == "1"
+_TAB_DOC = None  # None: not loaded yet; False: unavailable
+_TAB_FRESH = None
+_TAB_LINES = None
+
+
+def _tab_doc():
+    """The table-entry reader map, or False if it is missing, unreadable or of another Python."""
+    global _TAB_DOC
+    if _TAB_DOC is None:
+        _TAB_DOC = False
+        try:
+            import sys
+
+            p = os.environ.get("BR_TABMAP") or os.path.join(
+                os.path.dirname(os.environ.get("BR_MAP", "/app/map/blast.map")), "tab.json")
+            with open(p, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            if doc.get("v") == 1 and doc.get("python") == list(sys.version_info[:2]):
+                _TAB_DOC = doc
+        except Exception:  # noqa: BLE001
+            _TAB_DOC = False
+    return _TAB_DOC
+
+
+def _tab_lines(doc: dict) -> dict:
+    """file -> the lines on which the key of a listed entry starts."""
+    global _TAB_LINES
+    if _TAB_LINES is None:
+        out: dict = {}
+        for site, ent in doc["sites"].items():
+            lines = out.setdefault(site.split("|")[0], set())
+            for pos in ent:
+                lines.add(int(pos.split(":")[0]))
+        _TAB_LINES = out
+    return _TAB_LINES
+
+
+def _tab_fresh(doc: dict, repo: str, M: "Map") -> bool:
+    """The map was recorded on exactly this checkout and every test of tests.json ran in it."""
+    global _TAB_FRESH
+    if _TAB_FRESH is None:
+        _TAB_FRESH = False
+        try:
+            _TAB_FRESH = (_cmp_tree_digest(repo) == doc["digest"]
+                          and M.test_ids <= frozenset(doc["tests"]))
+        except Exception:  # noqa: BLE001
+            _TAB_FRESH = False
+    return _TAB_FRESH
+
+
+def _tab_literal(e: ast.expr) -> bool:
+    """A display of constants: evaluating it cannot fail, call anything or bind anything."""
+    if isinstance(e, ast.Constant):
+        return e.value is None or type(e.value) in (str, bytes, int, float, bool)
+    if isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.USub, ast.UAdd)):
+        return isinstance(e.operand, ast.Constant) and type(e.operand.value) in (int, float)
+    if isinstance(e, (ast.Tuple, ast.List)):
+        return all(_tab_literal(x) for x in e.elts)
+    if isinstance(e, ast.Set):
+        return all(isinstance(x, ast.Constant) and type(x.value) in (str, bytes, int, float, bool) for x in e.elts)
+    if isinstance(e, ast.Dict):
+        return (all(isinstance(k, ast.Constant) and type(k.value) in (str, bytes, int, float, bool) for k in e.keys)
+                and all(_tab_literal(v) for v in e.values))
+    return False
+
+
+def _tab_stmt(tree: ast.Module, ln: int):
+    """(index path, statement, name) of the class-level `NAME = {...}` holding line `ln`: a direct
+    statement of a class body whose enclosing blocks, up to the module, are class bodies only."""
+    body, trail = tree.body, []
+    while True:
+        for i, st in enumerate(body):
+            if st.lineno <= ln <= (st.end_lineno or st.lineno):
+                break
+        else:
+            return None
+        trail.append(i)
+        if isinstance(st, ast.ClassDef):
+            if ln < st.body[0].lineno:
+                return None  # decorators, bases, keywords
+            body = st.body
+            continue
+        if len(trail) < 2:
+            return None  # module level
+        name = None
+        if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+            name = st.targets[0].id
+        elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+            name = st.target.id
+        if name is None or not isinstance(st.value, ast.Dict):
+            return None
+        return trail, st, name
+
+
+def _tab_rule(path: str, fc: FileChange, repo: str, old_src: str, new_src: str, M: "Map"):
+    """v11. (tests, note) when the whole patch replaces, on one line, a literal value of ONE entry of
+    a class-level dict display by another literal, and the entry map lists the entry; else None.
+
+    Why only the listed tests can tell: the two files then build the same classes, functions and
+    tables except for the object stored under that one key (same keys, same order, no call and no
+    name involved in the old or the new value, so nothing else runs differently at import). The
+    map was recorded with that very table replaced by a dict that notes every lookup of a key and
+    every read of all its values, wherever the table object travels (subclasses, instances, other
+    classes that keep it, the tokenizer core). An entry is listed only if its key and the whole
+    table were never read while a module was being executed or outside a test (so nothing derived
+    from the value is kept anywhere at import), and the table was never changed after it was built."""
+    try:
+        if not TAB or fc.mode_change or not path.startswith("sqlglot/"):
+            return None
+        ln = fc.removed[0]
+        if ln <= 2 or _replacement_pairs(fc).get(ln) is None:
+            return None
+        doc = _tab_doc()
+        if not doc or ln not in _tab_lines(doc).get(path, ()):
+            return None  # no listed entry starts on this line: nothing to parse
+        told, tnew = ast.parse(old_src), ast.parse(new_src)
+        hit = _tab_stmt(told, ln)
+        if hit is None:
+            return None
+        trail, st, name = hit
+        node = tnew
+        for i in trail:
+            body = node.body
+            if i >= len(body):
+                return None
+            node = body[i]
+        if type(node) is not type(st) or not isinstance(node.value, ast.Dict):
+            return None
+        do, dn = st.value, node.value
+        if len(do.keys) != len(dn.keys) or len(do.values) != len(dn.values):
+            return None
+        diff = [i for i in range(len(do.values)) if ast.dump(do.values[i]) != ast.dump(dn.values[i])]
+        if len(diff) != 1 or do.keys[diff[0]] is None:
+            return None
+        i = diff[0]
+        if not (_tab_literal(do.values[i]) and _tab_literal(dn.values[i])):
+            return None
+        key = do.keys[i]
+        do.values[i] = dn.values[i] = ast.Constant(value=None)
+        if ast.dump(told) != ast.dump(tnew):
+            return None
+        ent = doc["sites"].get("%s|%d|%s" % (path, st.lineno, name))
+        if ent is None:
+            return None
+        k = ent.get("%d:%d" % (key.lineno, key.col_offset))
+        if k is None or not _tab_fresh(doc, repo, M):
+            return None
+        tests, acc, ids = set(), 0, doc["tests"]
+        for d in doc["sets"][k]:
+            acc += d
+            n = M.num.get(ids[acc])
+            if n is not None:
+                tests.add(n)
+        tests |= M.openers(path) | set(M.unmapped)
+        return tests, f"table entry {name}[{ast.unparse(key)}]: {len(tests)} readers"
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     path = fc.old_path or fc.path
     old_file = os.path.join(repo, path)
@@ -1487,6 +1649,15 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
             A.notes.append(f"{path}:{fc.removed[0]} {note}")
             if note.endswith("all identity-equivalent"):
                 return
+        # v11: one literal value of one entry of a class-level table: only the tests that looked
+        # that key up, or read all values of the table, can tell (see _tab_rule)
+        tab = _tab_rule(path, fc, repo, old_src, new_src, M)
+        if tab is not None:
+            A.notes.append(f"{path}:{fc.removed[0]} {tab[1]}")
+            if tab[0]:
+                A.cands |= tab[0]
+                A.changes.append((path, "import", fc.removed[0], fc.removed[0]))
+            return
     sc = FileScopes(old_src)
     old_lines = old_src.split("\n")
     pairs = _replacement_pairs(fc)
