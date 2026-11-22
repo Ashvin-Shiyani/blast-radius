@@ -43,16 +43,16 @@ every decision about a commit is derived from that commit's diff when the select
 - `map/tab.json` (shipped): per dict table written out in a class body of the sqlglot package
   (`NAME = {...}`) and per entry of it, the tests that looked that entry's key up or read all
   values of the table while the test suite ran; the tests that ran; the checkout's content
-  digest. An entry is left out if its key or the whole table was read while a module was being
-  executed or outside a test (something derived from it may be kept elsewhere), and a table is
-  left out if it was changed after it was built or was not built the same way in every run. No
-  verdicts, nothing about any edit. Made by running the suite with each such table replaced by a
+  digest, the Python version and the names of the four runs. An entry is left out if its key or
+  the whole table was read while a module was being executed or outside a test (something
+  derived from it may be kept elsewhere), and a table is left out if it was changed after it
+  was built or was not built the same way in every run. No verdicts, nothing about any edit. Made by running the suite with each such table replaced by a
   dict that behaves the same and notes key lookups and reads of all values, in this image's
   environment (every test forked, and as one session; two hash seeds each). When a patch changes
   exactly one literal value of one listed entry to another literal (or one literal argument of
   a call there, when the function called only creates and returns a function), on one line,
   `selector/static.py` takes the tests listed for that entry as the candidates; for anything
-  else its other rules decide. `BR_TAB=0` turns this off.
+  else its other rules decide. `BR_TAB=0` turns this off, `BR_TAB_CALLS=0` the part about calls.
 - `map/cost.json` (shipped): CPU seconds each test takes in the selector's own runner. Made by
   `selector/costmap.py` on the pinned checkout, measured once on a development machine.
 - `map/refs.json` (built with the image by `selector/refindex.py`): where each identifier is mentioned.
