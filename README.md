@@ -49,7 +49,8 @@ every decision about a commit is derived from that commit's diff when the select
   verdicts, nothing about any edit. Made by running the suite with each such table replaced by a
   dict that behaves the same and notes key lookups and reads of all values, in this image's
   environment (every test forked, and as one session; two hash seeds each). When a patch changes
-  exactly one literal value of one listed entry to another literal, on one line,
+  exactly one literal value of one listed entry to another literal (or one literal argument of
+  a call there, when the function called only creates and returns a function), on one line,
   `selector/static.py` takes the tests listed for that entry as the candidates; for anything
   else its other rules decide. `BR_TAB=0` turns this off.
 - `map/cost.json` (shipped): CPU seconds each test takes in the selector's own runner. Made by

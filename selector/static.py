@@ -1405,6 +1405,7 @@ def _cmp_rule(path: str, fc: FileChange, repo: str, old_src: str, new_src: str, 
 
 # ---- v11: readers of one entry of a class-level table ------------------------------------
 TAB = os.environ.get("BR_TAB", "1") == "1"
+TAB_CALLS = os.environ.get("BR_TAB_CALLS", "1") == "1"
 _TAB_DOC = None  # None: not loaded yet; False: unavailable
 _TAB_FRESH = None
 _TAB_LINES = None
@@ -1471,6 +1472,109 @@ def _tab_literal(e: ast.expr) -> bool:
     return False
 
 
+def _tab_no_eval(args: ast.arguments, returns, future_ann: bool) -> bool:
+    """Creating a function with these parameters evaluates nothing."""
+    if args.defaults or any(d is not None for d in args.kw_defaults):
+        return False
+    if future_ann:
+        return True
+    every = args.posonlyargs + args.args + args.kwonlyargs + [a for a in (args.vararg, args.kwarg) if a]
+    return returns is None and all(a.annotation is None for a in every)
+
+
+def _tab_only_binding(tree: ast.Module, name: str):
+    """The top-level statement that binds `name`, if nothing else in the file binds it anywhere."""
+    n = 0
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            n += node.name == name
+        elif isinstance(node, ast.Name):
+            n += node.id == name and not isinstance(node.ctx, ast.Load)
+        elif isinstance(node, ast.alias):
+            n += (node.asname or node.name.split(".")[0]) == name
+        elif isinstance(node, ast.arg):
+            n += node.arg == name
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            n += name in node.names
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            n += node.name == name
+        elif isinstance(node, ast.MatchMapping):
+            n += node.rest == name
+    if n != 1:
+        return None
+    for st in tree.body:
+        if isinstance(st, ast.FunctionDef) and st.name == name:
+            return st
+        if isinstance(st, ast.ImportFrom) and any((a.asname or a.name) == name for a in st.names):
+            return st
+    return None
+
+
+def _tab_future_ann(tree: ast.Module) -> bool:
+    return any(isinstance(st, ast.ImportFrom) and st.module == "__future__" and st.level == 0
+               and any(a.name == "annotations" for a in st.names) for st in tree.body)
+
+
+def _tab_closure_factory(tree: ast.Module, name: str, repo: str, ln: int) -> bool:
+    """`name`, as a class body of this file sees it, is a module-level function (defined here, or
+    in the sqlglot module it is imported from by name) that does nothing but create functions
+    and return one of them: calling it runs no other code, cannot fail for a call of the same
+    shape, and its only effect is the returned function, which keeps the arguments."""
+    st = _tab_only_binding(tree, name)
+    if st is None or (st.end_lineno or st.lineno) >= ln:
+        return False  # bound after the table is built: the name means something else there
+    if isinstance(st, ast.ImportFrom):
+        if st.level != 0 or not st.module or not st.module.startswith("sqlglot."):
+            return False
+        orig = [a.name for a in st.names if (a.asname or a.name) == name]
+        if len(orig) != 1 or orig[0] == "*":
+            return False
+        base = os.path.join(repo, *st.module.split("."))
+        if not os.path.isfile(base + ".py") or os.path.isdir(base):
+            return False
+        with open(base + ".py", encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        name = orig[0]
+        st = _tab_only_binding(tree, name)
+    if not isinstance(st, ast.FunctionDef) or st.decorator_list:
+        return False
+    fut = _tab_future_ann(tree)
+    body = st.body
+    if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+        body = body[1:]
+    if not body or not isinstance(body[-1], ast.Return) or body[-1].value is None:
+        return False
+    inner = set()
+    for x in body[:-1]:
+        if not isinstance(x, ast.FunctionDef) or x.decorator_list or not _tab_no_eval(x.args, x.returns, fut):
+            return False
+        inner.add(x.name)
+    r = body[-1].value
+    if isinstance(r, ast.Lambda):
+        return _tab_no_eval(r.args, None, True)
+    return isinstance(r, ast.Name) and r.id in inner
+
+
+def _tab_value_ok(vo: ast.expr, vn: ast.expr, told: ast.Module, repo: str, ln: int) -> bool:
+    """The old and the new value are literals, or the same call of a closure factory (see
+    _tab_closure_factory) with one literal argument replaced by another literal."""
+    if _tab_literal(vo) and _tab_literal(vn):
+        return True
+    if not (TAB_CALLS and isinstance(vo, ast.Call) and isinstance(vn, ast.Call)):
+        return False
+    if not (isinstance(vo.func, ast.Name) and isinstance(vn.func, ast.Name) and vo.func.id == vn.func.id):
+        return False
+    ao = list(vo.args) + [k.value for k in vo.keywords]
+    an = list(vn.args) + [k.value for k in vn.keywords]
+    if (len(vo.args) != len(vn.args) or [k.arg for k in vo.keywords] != [k.arg for k in vn.keywords]
+            or any(k.arg is None for k in vo.keywords) or any(isinstance(x, ast.Starred) for x in ao + an)):
+        return False
+    diff = [j for j in range(len(ao)) if ast.dump(ao[j]) != ast.dump(an[j])]
+    if len(diff) != 1 or not (_tab_literal(ao[diff[0]]) and _tab_literal(an[diff[0]])):
+        return False
+    return _tab_closure_factory(told, vo.func.id, repo, ln)
+
+
 def _tab_stmt(tree: ast.Module, ln: int):
     """(index path, statement, name) of the class-level `NAME = {...}` holding line `ln`: a direct
     statement of a class body whose enclosing blocks, up to the module, are class bodies only."""
@@ -1501,7 +1605,8 @@ def _tab_stmt(tree: ast.Module, ln: int):
 
 def _tab_rule(path: str, fc: FileChange, repo: str, old_src: str, new_src: str, M: "Map"):
     """v11. (tests, note) when the whole patch replaces, on one line, a literal value of ONE entry of
-    a class-level dict display by another literal, and the entry map lists the entry; else None.
+    a class-level dict display by another literal (or one literal argument of a call that only
+    creates and returns a function, see _tab_value_ok), and the entry map lists the entry; else None.
 
     Why only the listed tests can tell: the two files then build the same classes, functions and
     tables except for the object stored under that one key (same keys, same order, no call and no
@@ -1540,7 +1645,7 @@ def _tab_rule(path: str, fc: FileChange, repo: str, old_src: str, new_src: str, 
         if len(diff) != 1 or do.keys[diff[0]] is None:
             return None
         i = diff[0]
-        if not (_tab_literal(do.values[i]) and _tab_literal(dn.values[i])):
+        if not _tab_value_ok(do.values[i], dn.values[i], told, repo, st.lineno):
             return None
         key = do.keys[i]
         do.values[i] = dn.values[i] = ast.Constant(value=None)

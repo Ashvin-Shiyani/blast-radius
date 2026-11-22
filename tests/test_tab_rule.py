@@ -68,6 +68,53 @@ class TabRule(unittest.TestCase):
         self.refused(OLD.replace("NUMERIC_ESCAPES =", "NUMERIC_ESCAPEZ ="))  # the name
         self.refused(OLD.replace('"u": (16, 4', '**{}, "u": (17, 4'))  # an entry added
 
+    def test_closure_factory_argument(self):
+        rel = "sqlglot/parsers/singlestore.py"
+        old = '        "GROUPS FOR USER": _show_parser("GROUPS FOR USER", target=True),'
+        A, notes = run(rel, old, old.replace("target=True", "target=False"))
+        self.assertEqual(len(notes), 1, A.notes)
+        self.assertIn("SHOW_PARSERS['GROUPS FOR USER']", notes[0])
+        self.assertLess(len(A.cands), 5)
+        # the function called is replaced: not this rule
+        A, notes = run(rel, old, old.replace('_show_parser("GROUPS FOR USER", target=True)', '_show_parsers("GROUPS FOR USER", target=True)'))
+        self.assertEqual(notes, [])
+        # an argument that is not a literal
+        A, notes = run(rel, old, old.replace("target=True", "target=bool(1)"))
+        self.assertEqual(notes, [])
+        # another keyword: the call has another shape
+        A, notes = run(rel, old, old.replace("target=True", "targets=True"))
+        self.assertEqual(notes, [])
+        static.TAB_CALLS = False
+        try:
+            A, notes = run(rel, old, old.replace("target=True", "target=False"))
+            self.assertEqual(notes, [])
+        finally:
+            static.TAB_CALLS = True
+
+    def test_factory_shapes(self):
+        import ast
+
+        def ok(src, name="f", ln=99):
+            return static._tab_closure_factory(ast.parse(src), name, REPO, ln)
+
+        self.assertTrue(ok("def f(a):\n    return lambda self: a\n"))
+        self.assertTrue(ok("def f(*a, **k):\n    'doc'\n    def g(self):\n        return a\n    return g\n"))
+        self.assertTrue(ok("from __future__ import annotations\ndef f(a):\n    def g(self: X) -> Y:\n        return a\n    return g\n"))
+        self.assertFalse(ok("def f(a):\n    def g(self: X) -> Y:\n        return a\n    return g\n"))  # annotations are evaluated
+        self.assertFalse(ok("def f(a):\n    def g(self, b=a.x):\n        return a\n    return g\n"))  # a default is evaluated
+        self.assertFalse(ok("def f(a):\n    check(a)\n    return lambda self: a\n"))  # runs code
+        self.assertFalse(ok("def f(a):\n    return make(a)\n"))  # calls
+        self.assertFalse(ok("@deco\ndef f(a):\n    return lambda self: a\n"))  # decorated
+        self.assertFalse(ok("def f(a):\n    @deco\n    def g(self):\n        return a\n    return g\n"))
+        self.assertFalse(ok("def f(a):\n    return lambda self: a\nf = other\n"))  # bound twice
+        self.assertFalse(ok("def f(a):\n    return lambda self: a\nclass C:\n    f = 1\n"))  # bound in a class body
+        self.assertFalse(ok("if X:\n    def f(a):\n        return lambda self: a\n"))  # not at the top level
+        self.assertFalse(ok("def f(a):\n    return lambda self: a\n", ln=1))  # defined after the table
+        self.assertFalse(ok("async def f(a):\n    return lambda self: a\n"))
+        self.assertFalse(ok("def f(a):\n    def g(self):\n        return a\n    return h\n"))
+        self.assertFalse(ok("from .x import f\n"))  # relative import
+        self.assertTrue(ok("from sqlglot.dialects.dialect import rename_func\n", "rename_func"))
+
     def test_switch(self):
         static.TAB = False
         try:
