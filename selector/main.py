@@ -702,7 +702,7 @@ def decide(A, cands: set[int], ctx: dict, cid: str, probed, time_left: float) ->
             vcost[n] = costs.run(n)
     static_ms = pack(sorted(cands), dms)[0]
     # readers of a changed fixture nearly always fail: selected without being run
-    fixed = set(cands) & A.data_cands
+    fixed = set(cands) & (A.data_cands | A.sess_cands)
     kinds = {k for _, k, _, _ in A.changes}
     # every code change is an edit inside a function body or a lambda of an existing module
     code_only = bool(kinds) and kinds <= {"body", "lambda"} and not A.code_opaque

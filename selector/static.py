@@ -89,6 +89,20 @@ class Map:
         k = self.opens.get(f)
         return set(self.tset(k)) if k is not None else set()
 
+    def src_readers(self, f: str) -> set[int]:
+        """v11f: tests that read the source of a module of f's directory as text (opened a .py
+        file there). Such a test can compare what that source defines without running it (code
+        objects, the modules it names), so any code change in that directory may reach it.
+        Test modules are left out: pytest itself opens them."""
+        d = os.path.dirname(f) + "/"
+        out: set[int] = set()
+        if d.startswith("tests/"):
+            return out
+        for g, k in self.opens.items():
+            if g.endswith(".py") and g.startswith(d) and "/" not in g[len(d):]:
+                out |= self.tset(k)
+        return out
+
     def dir_openers(self, d: str) -> set[int]:
         prefix = d.rstrip("/") + "/"
         out: set[int] = set()
@@ -116,6 +130,8 @@ class Analysis:
     # the same, for python files only (a changed data file does not set it)
     code_opaque: bool = False
     data_cands: set[int] = field(default_factory=set)  # readers of changed data files
+    # v11f: tests selected without being run (a run in a fresh session cannot show the failure)
+    sess_cands: set[int] = field(default_factory=set)
 
 
 def _changed_span(old: str, new: str) -> tuple[int, int]:
@@ -1669,6 +1685,65 @@ def _tab_rule(path: str, fc: FileChange, repo: str, old_src: str, new_src: str, 
         return None
 
 
+# ---- v11f: lines that only a whole-suite session runs ------------------------------------
+SESS = os.environ.get("BR_SESS", "1") == "1"
+_SESS_DOC = None  # None: not loaded yet; False: unavailable
+_SESS_FRESH = None
+
+
+def _sess_doc():
+    """The session-only line map (map/sess.json), or False if it is missing or unreadable."""
+    global _SESS_DOC
+    if _SESS_DOC is None:
+        _SESS_DOC = False
+        try:
+            p = os.environ.get("BR_SESSMAP") or os.path.join(
+                os.path.dirname(os.environ.get("BR_MAP", "/app/map/blast.map")), "sess.json")
+            with open(p, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            if doc.get("v") == 1:
+                _SESS_DOC = doc
+        except Exception:  # noqa: BLE001
+            _SESS_DOC = False
+    return _SESS_DOC
+
+
+def _sess_rule(path: str, fc: FileChange, repo: str, old_src: str, M: "Map"):
+    """(every user of the file, note) when the change touches a def (decorators included) that
+    holds a statement only a whole-suite session runs: one the coverage map, made from tests
+    run each in a fresh process, never saw. Such a statement runs only after another test has
+    changed shared state, so neither the coverage map nor a run of the candidates in a fresh
+    session can tell who depends on it or on the lines that decide whether it runs."""
+    global _SESS_FRESH
+    if not SESS:
+        return None
+    doc = _sess_doc()
+    if not doc:
+        return None
+    lines = doc["lines"].get(path)
+    if not lines:
+        return None
+    if _SESS_FRESH is None:
+        try:
+            _SESS_FRESH = _cmp_tree_digest(repo) == doc["digest"]
+        except Exception:  # noqa: BLE001
+            _SESS_FRESH = False
+    if not _SESS_FRESH:
+        return None
+    spans = []
+    for node in ast.walk(ast.parse(old_src)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            lo = min([node.lineno] + [d.lineno for d in node.decorator_list])
+            if any(lo <= ln <= node.end_lineno for ln in lines):
+                spans.append((lo, node.end_lineno))
+    hit = sorted({ln for ln in fc.removed if any(lo <= ln <= hi for lo, hi in spans)}
+                 | {a + 1 for a in fc.added_after if any(lo - 1 <= a <= hi for lo, hi in spans)})
+    if not hit:
+        return None
+    users = M.file_users(path)
+    return users, f"line {hit[0]} in a def that runs statements only a whole-suite session runs -> all {len(users)} users, not verified"
+
+
 def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
     path = fc.old_path or fc.path
     old_file = os.path.join(repo, path)
@@ -1740,6 +1815,20 @@ def analyze_python(fc: FileChange, repo: str, M: Map, A: Analysis) -> None:
         A.opaque = True
         A.notes.append(f"{fc.path}: patched file does not compile -> {len(users)} users")
         return
+    # v11f: tests that read this directory's source as text compare what it defines without
+    # running it (tests/test_typing.py compares the annotators' code objects), so the line
+    # rules below, which follow execution, cannot see them
+    readers = M.src_readers(path)
+    if readers:
+        A.cands |= readers
+        A.notes.append(f"{path}: source of its directory read as text by {len(readers)}")
+    # v11f: a def with lines that only a whole-suite session runs (after another test changed
+    # shared state, e.g. cleared the dialect registry): every user of the file, not verified
+    sess = _sess_rule(path, fc, repo, old_src, M)
+    if sess is not None:
+        A.cands |= sess[0]
+        A.sess_cands |= sess[0]
+        A.notes.append(f"{path}: {sess[1]}")
     if len(fc.removed) + len(fc.added_text) > 200:
         # a sweeping edit: line-level precision is not worth the time; everyone who loads it
         A.cands |= users

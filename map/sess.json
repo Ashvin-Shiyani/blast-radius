@@ -1,0 +1,20 @@
+{
+"digest": "e514bf38e738b6ef3c5426ad81242103fbff2578eb63ea0035838afe8d2ef806",
+"lines": {
+"sqlglot/dialects/dialect.py": [
+249,
+250,
+251,
+256,
+257
+]
+},
+"runs": [
+"suite-default.json",
+"suite-seed77.json",
+"xdist2-random.json",
+"xdist4-seed0.json",
+"xdist8-4242.json"
+],
+"v": 1
+}

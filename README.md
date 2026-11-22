@@ -53,6 +53,15 @@ every decision about a commit is derived from that commit's diff when the select
   a call there, when the function called only creates and returns a function), on one line,
   `selector/static.py` takes the tests listed for that entry as the candidates; for anything
   else its other rules decide. `BR_TAB=0` turns this off, `BR_TAB_CALLS=0` the part about calls.
+- `map/sess.json` (shipped): the statements inside a def of the sqlglot package that ran while the
+  whole test suite ran as one process (sequentially, and spread over 2, 4 and 8 xdist workers) but
+  that `map/blast.map` never saw, because they run only after another test has changed shared
+  state (one clears the dialect registry); and the checkout's content digest. No test names, no
+  verdicts. Made with a line recorder (`sys.monitoring`) on a development machine (macOS,
+  Python 3.14; lines are source positions, kept only for statements of which no line is in
+  `map/blast.map`). When a patch changes a def (or its decorators) that holds such a statement,
+  `selector/static.py` selects every test that uses the file and does not run them first: a run
+  in a fresh process cannot show such a failure. `BR_SESS=0` turns this off.
 - `map/cost.json` (shipped): CPU seconds each test takes in the selector's own runner. Made by
   `selector/costmap.py` on the pinned checkout, measured once on a development machine.
 - `map/refs.json` (built with the image by `selector/refindex.py`): where each identifier is mentioned.
